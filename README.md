@@ -27,6 +27,13 @@
   - **下游影响**：哪些单元格直接 / 间接引用了它（改了它会影响谁）
   - **上游依赖**：该单元格直接 / 间接依赖谁（它的计算需要谁）
   - 每个受影响单元格的**层级（深度）**和一条**最短影响路径**
+- 🔑 **关键节点分析**：指定目标单元格后，在其上游依赖子图中计算近似最小割点
+  - 先将循环引用的**强连通分量（SCC）压缩为单节点**，再在 DAG 上统计每个节点出现在
+    多少条「输入源 → 目标」依赖路径上（覆盖路径数 = 经该节点的路径数，精确计数）
+  - 覆盖率 100% 的节点标记为**必经节点**（移除后目标无法计算）；返回每个节点的
+    覆盖路径数与占比、**受影响下游**（含目标）与一条**经过该节点的证据路径**
+  - 支持按覆盖路径数 / 受影响下游数 / 距目标层级**排序**、按工作表**筛选**、
+    覆盖数下限过滤与**导出关键节点 JSON**（路径数极大时附带大整数字符串字段）
 - 🗂 可按工作表筛选、按单元格 / 公式文本 / 名称名 / 名称定义搜索、切换是否只看公式单元格
 - 📄 查看每个单元格的公式原文、Excel 缓存计算值，及其引用的定义名称与解析状态
 - 🩺 **依赖健康审计**：扫描依赖图并按规则定级，支持按级别 / 工作表筛选
@@ -98,6 +105,8 @@ python -m pytest tests/ -v
 | `GET` | `/api/workbooks/{id}` | 工作簿统计摘要 |
 | `GET` | `/api/workbooks/{id}/cells?sheet=&q=&formulas_only=` | 单元格列表（支持工作表筛选 / 搜索） |
 | `GET` | `/api/workbooks/{id}/impact?cell=参数!B2&direction=downstream` | 影响面分析；`direction` 取 `downstream`（默认，受影响）或 `upstream`（依赖链） |
+| `GET` | `/api/workbooks/{id}/key-nodes?cell=&sheet=&sort=&min_coverage=&max_paths=` | 关键节点（上游近似最小割点）；`sort` 取 `coverage`（默认）/`affected`/`depth` |
+| `GET` | `/api/workbooks/{id}/key-nodes/export` | 导出关键节点分析 JSON（行数与受影响下游不截断） |
 | `GET` | `/api/workbooks/{id}/audit?level=&sheet=&fanout_threshold=` | 依赖健康审计；支持按级别（`error`/`warning`/`info`，可重复）、工作表、扇出阈值筛选 |
 | `GET` | `/api/workbooks/{id}/audit/export` | 导出依赖健康审计 JSON（证据边不截断） |
 | `GET` | `/api/workbooks/{id}/export` | 导出完整分析 JSON（含 `audit` 段） |
@@ -123,6 +132,76 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
 错误响应均为 4xx：工作簿不存在 / 已被淘汰返回 `404`；
 `level` 非法、`fanout_threshold` 不是 1–10000 的整数返回 `400`
 （响应体形如 `{"detail": "fanout_threshold 必须是 1-10000 的整数"}`）。
+
+### 关键节点 JSON 结构
+
+`GET /api/workbooks/{id}/key-nodes?cell=汇总!B2`（导出在 `/key-nodes/export`）：
+
+```json
+{
+  "workbook_id": "ab12cd34ef56",
+  "root": "汇总!B2",
+  "root_display": "汇总!B2",
+  "upstream_node_count": 10,
+  "scc_count": 0,
+  "source_count": 5,
+  "total_paths": 8,
+  "total_paths_text": "8",
+  "sampled_paths": 8,
+  "path_truncated": false,
+  "upstream_truncated": false,
+  "root_in_cycle": false,
+  "total": 10,
+  "returned": 10,
+  "filters": { "sheet": null, "sort": "coverage", "min_coverage": 1 },
+  "key_nodes": [
+    {
+      "cell": "计算!B6",
+      "type": "cell",
+      "node_id": "scc:9",
+      "sheet": "计算", "coord": "B6",
+      "display": "计算!B6",
+      "members": ["计算!B6"],
+      "member_displays": ["计算!B6"],
+      "in_cycle": false,
+      "formula": "=B5*参数!B6", "value": null,
+      "depth": 1,
+      "covered_paths": 8,
+      "covered_paths_text": "8",
+      "coverage_ratio": 1.0,
+      "cuts_all_paths": true,
+      "affected_downstream_count": 1,
+      "affected_downstream": ["汇总!B2"],
+      "affected_downstream_display": ["汇总!B2"],
+      "affected_downstream_truncated": false,
+      "evidence_path": ["参数!B6", "计算!B6", "汇总!B2"],
+      "evidence_path_raw": ["参数!B6", "计算!B6", "汇总!B2"],
+      "evidence_components": [
+        { "node_id": "scc:2", "type": "cell", "displays": ["参数!B6"] },
+        { "node_id": "scc:9", "type": "cell", "displays": ["计算!B6"] },
+        { "node_id": "scc:10", "type": "cell", "displays": ["汇总!B2"] }
+      ]
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `type=scc` 的行表示一个被压缩的**循环分量**：`cell` 为 `null`，`members`
+  列出分量内全部单元格，`display` 以 🔁 前缀展示；普通节点 `type=cell`。
+- `covered_paths` 是经过该节点的「输入源 → 目标」**路径总数（精确值，DAG 路径
+  计数 DP）**，`coverage_ratio` 为其占全部路径的比例；等于 1 时
+  `cuts_all_paths=true`，即移除该节点会切断目标的**全部**独立依赖路径（必经节点）。
+- `affected_downstream` 是上游子图内该节点可达的下游单元格（**含目标自身**，
+  接口最多返回 100 个样本，总数见 `affected_downstream_count`；导出不截断）。
+- `evidence_path` 是一条从输入源经该节点到目标的依赖链；路径数量爆炸时证据最多
+  枚举前 `max_paths`（默认 200）条，未被枚举节点的证据由 DP 父链拼接，此时
+  `path_truncated=true`（覆盖数仍为精确值）。极端工作簿路径数可能超出 JS 安全
+  整数范围，请同时参考 `covered_paths_text` / `total_paths_text` 字符串字段。
+- 目标自身处于循环中时 `root_in_cycle=true`；上游节点超过 5000 时
+  `upstream_truncated=true`。非法 `sort` 返回 422，`cell` 格式错误返回
+  400，工作表 / 工作簿不存在返回 404。
 
 ### 审计 JSON 结构
 
@@ -291,7 +370,10 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
    `计算!系数`），以及未定义 / 失效 / 外部名称的状态标记；
 6. 点击右上角「🩺 依赖健康审计」，在审计面板按级别 / 工作表筛选（试试限定到「名称」表），
    或将扇出阈值调小查看高扇出节点，点击证据边中的单元格可跳转到其影响面；
-7. 点击「导出分析 JSON」或「导出审计 JSON」获得机器可读的完整结果（含名称清单与使用留痕）。
+7. 点击「导出分析 JSON」或「导出审计 JSON」获得机器可读的完整结果（含名称清单与使用留痕）；
+8. 选中一个汇总类单元格（如 `汇总!B2`）后点击「🔑 关键节点分析」，查看上游依赖中
+   覆盖率最高的必经节点（如 `计算!B6` 覆盖 100% 路径），按受影响下游数排序或限定
+   工作表观察，并可展开每条证据路径、导出关键节点 JSON。
 
 ## 实现要点
 
@@ -313,6 +395,10 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
   - 名称目标与直接引用走同一套展开 / 越界 / 缺失工作表逻辑，无效目标一律不入图；
   - 迭代版 Tarjan SCC 检测单元格循环引用（经名称建立的边同样参与）；
   - BFS 求影响面，记录最短路径、层级与环标记，默认最大深度 50 / 5000 节点；
+  - 关键节点：在上游诱导子图上跑 Tarjan SCC 并将循环分量压缩为单节点得到 DAG，
+    路径计数 DP（`in_paths × out_paths`，Python 大整数）精确计算每个节点覆盖的
+    「源 → 目标」依赖路径数与必经节点，位集 DP 求受影响下游，广度枚举前 200 条
+    路径作证据（超出部分由 DP 父链拼接）；
   - 构图时记录不入图的异常引用与名称使用留痕，`audit()` 汇总八类问题并按级别 /
     工作表筛选，证据边超过 100 条时截断；导出保留名称、解析状态与完整证据。
 - `app/main.py`：FastAPI 路由与内存 LRU 式工作簿缓存（不落盘，重启即清空）。
@@ -329,7 +415,7 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
 │   └── static/index.html    # 前端单页
 ├── samples/sample_impact.xlsx
 ├── scripts/make_sample.py   # 示例文件生成脚本
-├── tests/                   # pytest 用例（78 个）
+├── tests/                   # pytest 用例（94 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

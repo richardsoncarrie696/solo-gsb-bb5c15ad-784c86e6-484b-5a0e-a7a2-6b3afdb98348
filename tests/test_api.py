@@ -267,6 +267,114 @@ def test_audit_export_includes_name_inventory_and_usages():
     assert ex["formulas"]["计算!B2"]["names"][0]["status"] == "undefined"
 
 
+def make_key_nodes_xlsx() -> bytes:
+    """A1/A2 两条独立支链经 B1/B2、C1 汇聚，D1 为目标；C1 为必经节点。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "K1"
+    ws["A1"], ws["A2"] = 1, 2
+    ws["B1"] = "=A1"
+    ws["B2"] = "=A2"
+    ws["C1"] = "=B1+B2"
+    ws["D1"] = "=C1*2"
+    loop = wb.create_sheet("环K")
+    loop["A1"] = "=B1+1"
+    loop["B1"] = "=A1*2"
+    loop["C1"] = "=A1"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_key_nodes_endpoint():
+    wid = client.post("/api/upload", files={"file":("k.xlsx", make_key_nodes_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    r = client.get(f"/api/workbooks/{wid}/key-nodes", params={"cell": "K1!D1"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["workbook_id"] == wid and d["root_display"] == "K1!D1"
+    assert d["total_paths"] == 2 and d["path_truncated"] is False
+    by = {k["cell"]: k for k in d["key_nodes"]}
+    c1 = by["K1!C1"]
+    assert c1["covered_paths"] == 2 and c1["cuts_all_paths"] is True
+    assert c1["affected_downstream"] == ["K1!D1"]
+    assert c1["evidence_path"][-1] == "K1!D1"
+    # 必备字段
+    required = {"cell", "type", "covered_paths", "covered_paths_text",
+                "coverage_ratio", "cuts_all_paths", "affected_downstream_count",
+                "affected_downstream_display", "evidence_path",
+                "evidence_components", "depth", "members"}
+    assert required <= set(d["key_nodes"][0])
+
+
+def test_key_nodes_filters_and_sorts():
+    wid = client.post("/api/upload", files={"file":("k.xlsx", make_key_nodes_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    # 排序
+    d = client.get(f"/api/workbooks/{wid}/key-nodes",
+                   params={"cell": "K1!D1", "sort": "depth"}).json()
+    depths = [k["depth"] for k in d["key_nodes"]]
+    assert depths == sorted(depths, reverse=True)
+    # 覆盖数下限
+    d = client.get(f"/api/workbooks/{wid}/key-nodes",
+                   params={"cell": "K1!D1", "min_coverage": 2}).json()
+    assert {k["cell"] for k in d["key_nodes"]} == {"K1!C1"}
+    # 工作表筛选
+    d = client.get(f"/api/workbooks/{wid}/key-nodes",
+                   params={"cell": "K1!D1", "sheet": "K1"}).json()
+    assert all(k["sheet"] == "K1" for k in d["key_nodes"])
+
+
+def test_key_nodes_cycle_target_scc_collapsed():
+    wid = client.post("/api/upload", files={"file":("k.xlsx", make_key_nodes_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    d = client.get(f"/api/workbooks/{wid}/key-nodes",
+                   params={"cell": "环K!C1"}).json()
+    assert d["scc_count"] == 1
+    scc = next(k for k in d["key_nodes"] if k["type"] == "scc")
+    assert set(scc["members"]) == {"环K!A1", "环K!B1"}
+    assert scc["cuts_all_paths"] is True
+    assert scc["evidence_components"][0]["type"] == "scc"
+
+
+def test_key_nodes_export():
+    wid = client.post("/api/upload", files={"file":("k.xlsx", make_key_nodes_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    r = client.get(f"/api/workbooks/{wid}/key-nodes/export",
+                   params={"cell": "K1!D1"})
+    assert r.status_code == 200
+    assert "key_nodes_" in r.headers["content-disposition"]
+    d = r.json()
+    assert d["target"] == "K1!D1" and d["filename"] == "k.xlsx"
+    assert d["total_paths"] == 2
+    # 导出不限行数、下游列表完整
+    c1 = next(k for k in d["key_nodes"] if k["cell"] == "K1!C1")
+    assert c1["affected_downstream"] == ["K1!D1"]
+    assert "covered_paths_text" in c1
+
+
+def test_key_nodes_bad_params_are_4xx():
+    wid = client.post("/api/upload", files={"file":("k.xlsx", make_key_nodes_xlsx(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                      ).json()["workbook_id"]
+    assert client.get(f"/api/workbooks/{wid}/key-nodes",
+                      params={"cell": "D1"}).status_code == 400
+    assert client.get(f"/api/workbooks/{wid}/key-nodes",
+                      params={"cell": "No!A1"}).status_code == 404
+    assert client.get(f"/api/workbooks/{wid}/key-nodes",
+                      params={"cell": "K1!D1", "sort": "weird"}).status_code == 422
+    assert client.get(f"/api/workbooks/{wid}/key-nodes",
+                      params={"cell": "K1!D1", "min_coverage": 0}).status_code == 422
+    assert client.get(f"/api/workbooks/{wid}/key-nodes",
+                      params={"cell": "K1!D1", "sheet": "不存在"}).status_code == 404
+    assert client.get(f"/api/workbooks/deadbeefab/key-nodes",
+                      params={"cell": "K1!D1"}).status_code == 404
+
+
 def test_audit_undefined_name_endpoint():
     wid = client.post("/api/upload", files={"file": ("n.xlsx", make_names_xlsx(),
                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}

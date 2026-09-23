@@ -103,6 +103,24 @@
   #auditCountPill { background: var(--warn); color: #fff; border-radius: 10px;
                     font-size: 11px; padding: 0 7px; margin-left: 4px; display: none; }
   #auditCountPill.zero { background: var(--accent2); }
+  /* 关键节点面板 */
+  #keyView select, #keyView input[type=number] { width: auto; min-width: 120px; }
+  #keyView input[type=number] { width: 90px; }
+  #keyView .filters-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .kn-summary { display: flex; gap: 10px; flex-wrap: wrap; }
+  .kn-summary .ac { border-radius: 8px; padding: 6px 12px; background: var(--panel2); font-size: 13px; }
+  .kn-summary .ac b { font-size: 16px; margin-left: 6px; }
+  .kn-summary .ac.hot b { color: #fbbf24; }
+  .badge.kn-cut { background: #7f1d1d; color: #fecaca; }
+  .badge.kn-scc { background: #5b21b6; color: #ddd6fe; }
+  .cov-bar { background: var(--chip); border-radius: 4px; height: 6px; width: 90px;
+             display: inline-block; vertical-align: middle; overflow: hidden; margin-left: 6px; }
+  .cov-bar i { display: block; height: 100%; background: var(--accent); }
+  .cov-bar.hot i { background: #fbbf24; }
+  .kn-aff { font-size: 12px; color: var(--muted); }
+  .kn-aff .chip { font-size: 11px; padding: 2px 7px; margin: 2px 3px 0 0; }
+  .kn-note { background: #3a2a12; color: #fde68a; border-radius: 8px; padding: 8px 12px;
+             font-size: 12px; margin-top: 8px; display: none; }
   #dropHint { border: 2px dashed var(--border); border-radius: 10px; padding: 40px;
               text-align: center; color: var(--muted); margin: 30px; }
   #dropHint.drag { border-color: var(--accent); color: var(--accent); }
@@ -178,9 +196,50 @@
         </table>
       </div>
     </div>
+    <div id="keyView" style="display:none">
+      <div class="card">
+        <h3>🔑 关键节点（上游依赖子图近似最小割点）
+          <button class="btn ghost" id="keyBackBtn" style="float:right;padding:3px 12px;font-size:12px">← 返回影响面</button>
+        </h3>
+        <div class="muted" style="font-size:12px;line-height:1.7">
+          目标单元格：<b class="mono" id="knTarget"></b>。在其上游依赖子图中，先将循环引用的强连通分量压缩为单节点，
+          再统计每个节点出现在多少条「输入源 → 目标」依赖路径上：<b>覆盖路径数越多，移除它切断的独立依赖路径越多</b>；
+          覆盖率 100% 标记为 <span class="badge kn-cut">必经节点</span>，移除后目标将无法计算。
+        </div>
+        <div id="knRootCycle" class="kn-note">⚠ 目标自身处于循环引用中，该循环已压缩为单个分量参与计算。</div>
+        <div class="filters-row" style="margin-top:10px">
+          <select id="knSheet"><option value="">全部工作表</option></select>
+          <span class="muted" style="font-size:12px">排序</span>
+          <select id="knSort">
+            <option value="coverage">按覆盖路径数</option>
+            <option value="affected">按受影响下游数</option>
+            <option value="depth">按距目标层级</option>
+          </select>
+          <span class="muted" style="font-size:12px">覆盖数 ≥</span>
+          <input type="number" id="knMinCov" min="1" value="1">
+          <button class="btn" id="keyRunBtn" style="padding:6px 14px">重新分析</button>
+          <button class="btn ghost" id="keyExportBtn" style="padding:6px 14px">导出关键节点 JSON</button>
+          <span id="knErr" class="muted" style="font-size:12px;color:var(--warn)"></span>
+        </div>
+        <div class="kn-summary" id="knSummary"></div>
+        <div id="knTruncated" class="kn-note" style="background:#23304a;color:#bfdbfe"></div>
+      </div>
+      <div class="card">
+        <h3 id="knTableTitle">关键节点清单</h3>
+        <table>
+          <thead><tr>
+            <th style="width:200px">节点</th><th style="width:170px">覆盖路径数</th>
+            <th style="width:130px">受影响下游</th><th>证据路径（一条经该节点到目标的依赖链）</th>
+          </tr></thead>
+          <tbody id="knRows"></tbody>
+        </table>
+      </div>
+    </div>
     <div id="detailBody" style="display:none">
       <div class="card">
-        <h3>当前单元格</h3>
+        <h3>当前单元格
+          <button class="btn" id="keyBtn" style="float:right;padding:3px 12px;font-size:12px">🔑 关键节点分析</button>
+        </h3>
         <div style="font-size:16px" class="mono" id="dCell"></div>
         <div style="margin-top:8px" class="formula-code" id="dFormula"></div>
         <div style="margin-top:8px" class="muted">缓存值：<span id="dValue" class="mono"></span>
@@ -314,6 +373,9 @@ function onUploaded(d) {
   const asel = $('auditSheet');
   asel.innerHTML = '<option value="">全部工作表</option>' +
     d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+  const ksel = $('knSheet');
+  ksel.innerHTML = '<option value="">全部工作表</option>' +
+    d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
 
   const cp = $('cyclePanel');
   if (d.cycle_count > 0) {
@@ -374,6 +436,9 @@ async function selectCell(cell) {
   // cell 为后端内部 id（工作表名!坐标，无引号）
   CURRENT = cell;
   showImpactView();
+  $('knSheet').value = '';
+  $('knSort').value = 'coverage';
+  $('knMinCov').value = '1';
   document.querySelectorAll('.cell-item').forEach(el =>
     el.classList.toggle('active', el.dataset.cell === cell));
   await loadImpact(cell);
@@ -414,15 +479,24 @@ async function loadImpact(cell) {
     </tr>`).join('') || '<tr><td colspan="5" class="muted" style="padding:14px">无</td></tr>';
 }
 
-// ---------------- 依赖健康审计 ----------------
+// ---------------- 依赖健康审计 / 关键节点视图切换 ----------------
 function showImpactView() {
   $('auditView').style.display = 'none';
+  $('keyView').style.display = 'none';
   $('empty').style.display = CURRENT ? 'none' : 'block';
   $('detailBody').style.display = CURRENT ? 'block' : 'none';
 }
 
 function showAuditView() {
   $('auditView').style.display = 'block';
+  $('keyView').style.display = 'none';
+  $('empty').style.display = 'none';
+  $('detailBody').style.display = 'none';
+}
+
+function showKeyView() {
+  $('auditView').style.display = 'none';
+  $('keyView').style.display = 'block';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
 }
@@ -526,6 +600,122 @@ async function loadAudit() {
       </td>
     </tr>`).join('')
     || '<tr><td colspan="4" class="muted" style="padding:14px">🎉 当前筛选条件下未发现问题</td></tr>';
+}
+
+// ---------------- 关键节点分析 ----------------
+$('keyBtn').onclick = async () => {
+  if (!CURRENT) return;
+  showKeyView();
+  // 面板的工作表筛选同步为当前单元格所在表之外的全部工作表
+  await loadKeyNodes();
+};
+$('keyBackBtn').onclick = () => showImpactView();
+$('keyRunBtn').onclick = () => loadKeyNodes();
+$('knSheet').onchange = () => loadKeyNodes();
+$('knSort').onchange = () => loadKeyNodes();
+$('knMinCov').onchange = () => loadKeyNodes();
+
+function keyParams(extra) {
+  const p = new URLSearchParams({ cell: CURRENT });
+  const sh = $('knSheet').value;
+  if (sh) p.set('sheet', sh);
+  p.set('sort', $('knSort').value);
+  const mc = $('knMinCov').value;
+  if (mc !== '' && Number(mc) >= 1) p.set('min_coverage', mc);
+  if (extra) p.set('max_paths', extra);
+  return p;
+}
+
+$('keyExportBtn').onclick = () => {
+  if (!WID || !CURRENT) return;
+  window.location = `/api/workbooks/${WID}/key-nodes/export?` + keyParams();
+};
+
+function renderKeySummary(d) {
+  const cuts = d.key_nodes.filter(k => k.cuts_all_paths).length;
+  const scc = d.key_nodes.filter(k => k.type === 'scc').length;
+  const totalPaths = d.total_paths_text || String(d.total_paths);
+  $('knSummary').innerHTML =
+    `<span class="ac hot">关键节点<b>${d.total}</b></span>` +
+    `<span class="ac">必经节点（覆盖率 100%）<b>${cuts}</b></span>` +
+    `<span class="ac">循环分量<b>${d.scc_count}</b></span>` +
+    `<span class="ac">上游单元格<b>${d.upstream_node_count}</b></span>` +
+    `<span class="ac">输入源<b>${d.source_count}</b></span>` +
+    `<span class="ac">源→目标路径总数<b>${totalPaths}</b></span>` +
+    (scc ? `<span class="ac">结果中的循环分量<b>${scc}</b></span>` : '');
+  const notes = [];
+  if (d.upstream_truncated)
+    notes.push('⚠ 上游依赖超过 5000 个节点，子图已截断，结果仅覆盖部分依赖。');
+  if (d.path_truncated)
+    notes.push(`ℹ 路径数量巨大，证据路径仅枚举前 ${d.sampled_paths} 条，未被枚举节点的证据由算法拼接；覆盖数为精确值。`);
+  const t = $('knTruncated');
+  if (notes.length) { t.style.display = 'block'; t.innerHTML = notes.join('<br>'); }
+  else t.style.display = 'none';
+  $('knRootCycle').style.display = d.root_in_cycle ? 'block' : 'none';
+}
+
+function renderKeyRows(d) {
+  $('knTableTitle').textContent = `关键节点清单（共 ${d.total} 个，显示 ${d.returned} 个）`;
+  if (!d.key_nodes.length) {
+    $('knRows').innerHTML = '<tr><td colspan="4" class="muted" style="padding:14px">' +
+      (d.total_paths === 0 ? '该单元格没有上游依赖（是纯输入项），无关键节点。'
+                           : '当前筛选条件下没有符合要求的节点。') + '</td></tr>';
+    return;
+  }
+  const totalPaths = d.total_paths || 1;
+  $('knRows').innerHTML = d.key_nodes.map(k => {
+    const pct = k.coverage_ratio * 100;
+    const covText = k.covered_paths_text || String(k.covered_paths);
+    const target = d.root_display || d.root;
+    const nodeCell = k.type === 'scc' ? '' : (k.cell || '');
+    const nameHtml = k.type === 'scc'
+      ? `<span style="font-family:ui-monospace,Consolas,monospace">${esc(k.display)}</span><br><span class="muted" style="font-size:11px">分量成员（${k.member_displays.length}）：</span>` +
+        k.member_displays.slice(0, 8).map(m =>
+          `<span class="chip">${esc(m)}</span>`).join('') +
+        (k.member_displays.length > 8 ? `<span class="muted" style="font-size:11px">…</span>` : '')
+      : `<a class="link js-cell" data-cell="${esc(nodeCell)}" style="font-family:ui-monospace,Consolas,monospace">${esc(k.display)}</a>` +
+        (k.in_cycle ? ' <span class="badge cycle">循环</span>' : '') +
+        (k.formula ? `<div class="path" style="margin-top:3px">${esc(k.formula)}</div>` : '');
+    const badges = (k.cuts_all_paths ? ' <span class="badge kn-cut">必经节点</span>' : '') +
+                   (k.type === 'scc' ? ' <span class="badge kn-scc">SCC</span>' : '');
+    const affChips = k.affected_downstream_display.slice(0, 10).map((a, i) =>
+      `<a class="chip js-cell" data-cell="${esc(k.affected_downstream[i] || '')}">${esc(a)}</a>`).join('');
+    const affHtml = k.affected_downstream_count
+      ? `<div><b>${k.affected_downstream_count}</b> 个<span class="muted" style="font-size:11px">（含目标）</span></div>
+         <div class="kn-aff">${affChips}` +
+        (k.affected_downstream_truncated
+          ? `<div>…仅列前 ${k.affected_downstream_display.length} 个</div>` : '') + `</div>`
+      : '<span class="muted">0</span>';
+    const evComps = k.evidence_components || [];
+    const evHtml = evComps.map((c, idx) => {
+      const label = c.type === 'scc'
+        ? `<span class="badge kn-scc">🔁${esc(c.displays.join('、'))}</span>`
+        : `<a class="link js-cell" data-cell="${esc(k.evidence_path_raw[idx] || '')}">${esc(c.displays[0])}</a>`;
+      return `<span>${label}</span>`;
+    }).join(' → ');
+    return `<tr>
+      <td>${nameHtml}</td>
+      <td>
+        <b>${covText}</b> <span class="muted">/ ${d.total_paths_text || d.total_paths}</span>
+        <span class="muted">（${pct.toFixed(1)}%）</span>${badges}
+        <div style="margin-top:4px"><span class="cov-bar ${pct >= 100 ? 'hot' : ''}"><i style="width:${Math.min(pct,100)}%"></i></span>
+        <span class="muted" style="font-size:11px">　距目标 ${k.depth} 层</span></div>
+      </td>
+      <td>${affHtml}</td>
+      <td class="path">${evHtml || '<span class="muted">—</span>'}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadKeyNodes() {
+  if (!WID || !CURRENT) return;
+  $('knErr').textContent = '';
+  $('knTarget').textContent = CURRENT;
+  const r = await fetch(`/api/workbooks/${WID}/key-nodes?` + keyParams());
+  const d = await r.json();
+  if (!r.ok) { $('knErr').textContent = d.detail || '关键节点分析失败'; return; }
+  renderKeySummary(d);
+  renderKeyRows(d);
 }
 
 // ---------------- 导出 ----------------

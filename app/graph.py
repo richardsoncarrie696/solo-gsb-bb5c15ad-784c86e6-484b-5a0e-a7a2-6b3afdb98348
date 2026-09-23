@@ -24,6 +24,15 @@ MAX_IMPACT_NODES = 5000
 DEFAULT_FANOUT_THRESHOLD = 20
 # 单条审计问题附带的证据边上限，防止超大区域把响应撑爆
 MAX_AUDIT_EVIDENCE = 100
+# 关键节点分析：枚举「输入源 -> 目标」依赖路径的默认 / 上限条数（近似割点用）
+DEFAULT_KEY_PATHS = 200
+MAX_KEY_PATHS_QUERY = 1000
+# 路径枚举时每层保留的部分路径上限与总扩展次数上限（防组合爆炸打爆 CPU）
+MAX_KEY_FRONTIER = 20000
+MAX_KEY_EXTENSIONS = 1_000_000
+# 关键节点接口默认返回行数（导出不受限）；每行受影响下游示例数
+DEFAULT_KEY_NODE_LIMIT = 500
+KEY_NODE_DOWNSTREAM_SAMPLE = 100
 
 # 审计问题级别 -> 排序权重（越严重越靠前）
 SEVERITY_WEIGHT = {"error": 0, "warning": 1, "info": 2}
@@ -406,6 +415,390 @@ class WorkbookGraph:
             "impacted": items,
             "truncated": truncated,
             "total": len(items),
+        }
+
+    # ------------------------------------------------------ 关键节点分析
+    @staticmethod
+    def _scc_on(nodes: set[str], adj: dict[str, set[str]]) -> list[list[str]]:
+        """在给定节点子集与邻接表上跑迭代版 Tarjan，返回强连通分量列表。
+
+        指向子集外的边一律忽略（等价于先取诱导子图）。非公式叶子不在 adj
+        的键中，预先作为独立起点登记，避免被漏掉而成为单节点 SCC。
+        """
+        index_of: dict[str, int] = {}
+        lowlink: dict[str, int] = {}
+        on_stack: set[str] = set()
+        stack: list[str] = []
+        sccs: list[list[str]] = []
+        counter = 0
+
+        for root in sorted(nodes):
+            if root in index_of:
+                continue
+            work = [(root, iter(sorted(adj.get(root, set()) & nodes)))]
+            index_of[root] = lowlink[root] = counter
+            counter += 1
+            stack.append(root)
+            on_stack.add(root)
+            while work:
+                node, it = work[-1]
+                advanced = False
+                for nxt in it:
+                    if nxt not in nodes:
+                        continue
+                    if nxt not in index_of:
+                        index_of[nxt] = lowlink[nxt] = counter
+                        counter += 1
+                        stack.append(nxt)
+                        on_stack.add(nxt)
+                        work.append((nxt, iter(sorted(adj.get(nxt, set()) & nodes))))
+                        advanced = True
+                        break
+                    elif nxt in on_stack:
+                        lowlink[node] = min(lowlink[node], index_of[nxt])
+                if advanced:
+                    continue
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    lowlink[parent] = min(lowlink[parent], lowlink[node])
+                if lowlink[node] == index_of[node]:
+                    scc = []
+                    while True:
+                        w = stack.pop()
+                        on_stack.discard(w)
+                        scc.append(w)
+                        if w == node:
+                            break
+                    sccs.append(scc)
+        return sccs
+
+    def key_nodes(
+        self,
+        node: str,
+        sheet: str | None = None,
+        sort: str = "coverage",
+        min_coverage: int = 1,
+        limit: int | None = DEFAULT_KEY_NODE_LIMIT,
+        max_paths: int = DEFAULT_KEY_PATHS,
+    ) -> dict:
+        """在上游依赖子图中计算关键节点（近似最小割点分析）。
+
+        步骤：
+          1. 反向遍历求目标单元格的全部上游可达节点，得到上游诱导子图；
+          2. Tarjan 求强连通分量并把每个循环分量压缩为单节点，压缩图为 DAG；
+          3. DAG 路径计数 DP：in_paths[v]（源 -> v）与 out_paths[v]
+             （v -> 目标），二者乘积即经过 v 的独立依赖路径总数（精确值，
+             Python 大整数），覆盖率 100% 即必经节点（精确割点）；
+          4. 位集 DP 求每个分量可达的受影响下游；广度枚举前 max_paths 条
+             完整路径作为证据样本，未覆盖到的节点用 DP 父链拼出一条经它
+             到目标的证据路径兜底。
+
+        「近似」体现在以经过节点的源→目标路径数衡量割点重要性（而非直接求
+        全局最小点割集，后者为 NP 难）；单节点必经关系则是精确的。
+        """
+        # 1) 上游可达诱导子图（目标自身含在 reach 内）
+        reach: set[str] = {node}
+        stack_u = [node]
+        upstream_truncated = False
+        while stack_u:
+            cur = stack_u.pop()
+            for pre in self.precedents.get(cur, ()):  # set 迭代，规模有界
+                if pre in reach:
+                    continue
+                if len(reach) >= MAX_IMPACT_NODES:
+                    upstream_truncated = True
+                    break
+                reach.add(pre)
+                stack_u.append(pre)
+            if upstream_truncated:
+                break
+
+        # 2) 子图上的 SCC（与全局环检测结果一致，但限制在子图范围内）
+        sccs = self._scc_on(reach, self.precedents)
+        comp_of: dict[str, int] = {}
+        members: list[list[str]] = []
+        for scc in sccs:
+            ci = len(members)
+            ms = sorted(scc)
+            members.append(ms)
+            for m in ms:
+                comp_of[m] = ci
+        # 大小>1 或存在指向自身分量的边（自环）即循环分量
+        cyclic = [
+            len(ms) > 1
+            or any(t in reach and comp_of[t] == ci
+                   for t in self.precedents.get(ms[0], ()))
+            for ci, ms in enumerate(members)
+        ]
+        target_ci = comp_of[node]
+
+        # 3) 压缩 DAG：pred[ci] 为直接上游分量，cons[ci] 为直接下游分量。
+        #    非公式叶子不是 precedents 的键，边的收集要覆盖 reach 中全部节点。
+        pred: list[set[int]] = [set() for _ in members]
+        cons: list[set[int]] = [set() for _ in members]
+        for u in reach:
+            cu = comp_of[u]
+            for v in self.precedents.get(u, ()):
+                if v not in reach:
+                    continue
+                cv = comp_of[v]
+                if cv != cu:
+                    pred[cu].add(cv)
+                    cons[cv].add(cu)
+        source_cis = [ci for ci in range(len(members))
+                      if not pred[ci] and ci != target_ci]
+
+        # 4) DAG 路径计数（精确值，Python 大整数）：
+        #    in_paths[ci]  = 任一输入源 -> ci 的路径数（源为 1）
+        #    out_paths[ci] = ci -> 目标的路径数（目标为 1；上游子图内每个节点
+        #                    都可达目标，故该值恒 >= 1）
+        #    经过 ci 的完整依赖路径数 = in_paths[ci] * out_paths[ci]
+        ncomp_t = len(members)
+        topo: list[int] = []  # 源 -> 目标 的拓扑序
+        indeg = [len(pred[ci]) for ci in range(ncomp_t)]
+        q = deque(ci for ci in range(ncomp_t) if indeg[ci] == 0)
+        while q:
+            cur = q.popleft()
+            topo.append(cur)
+            for child in sorted(cons[cur]):
+                indeg[child] -= 1
+                if indeg[child] == 0:
+                    q.append(child)
+
+        in_paths = [0] * ncomp_t
+        for ci in topo:
+            if ci == target_ci:
+                # 目标无上游时路径数为 0（没有「源 -> 目标」的路径）；
+                # 有上游时由前驱的 in_paths 之和给出
+                in_paths[ci] = (sum(in_paths[p] for p in pred[ci])
+                                if pred[ci] else 0)
+            elif not pred[ci]:
+                in_paths[ci] = 1
+            else:
+                in_paths[ci] = sum(in_paths[p] for p in pred[ci])
+        out_paths = [0] * ncomp_t
+        for ci in reversed(topo):
+            out_paths[ci] = 1 if ci == target_ci else sum(
+                out_paths[c] for c in cons[ci])
+        total_paths = in_paths[target_ci]
+        coverage = [in_paths[ci] * out_paths[ci] for ci in range(ncomp_t)]
+
+        # 深度：距目标的最长链层数（目标 0）
+        depth_of: dict[int, int] = {ci: 0 for ci in range(ncomp_t)}
+        for ci in reversed(topo):
+            if cons[ci]:
+                depth_of[ci] = 1 + max(depth_of[c] for c in cons[ci])
+
+        # 受影响下游：DAG 位集 DP，一次求出每个分量可达的下游分量集合
+        desc_bits = [0] * ncomp_t
+        for ci in reversed(topo):
+            bits = 0
+            for child in cons[ci]:
+                bits |= 1 << child
+                bits |= desc_bits[child]
+            desc_bits[ci] = bits
+        member_count = [len(ms) for ms in members]
+
+        def downstream_of(ci: int) -> tuple[list[str], int]:
+            """返回 (受影响下游单元格（已排序）, 总数)。
+
+            受影响下游 = 子图内该分量可达的全部分量（含目标自身——割点被移除
+            后正是目标的值无法算出；不含该分量自身）。
+            """
+            bits = desc_bits[ci]
+            total = sum(member_count[cj] for cj in range(ncomp_t)
+                        if bits & (1 << cj))
+            out: list[str] = []
+            b = bits
+            while b:
+                low = b & -b
+                cj = low.bit_length() - 1
+                out.extend(members[cj])
+                b -= low
+            out.sort()
+            return out, total
+
+        # 5) 证据路径：先按层广度枚举至多 max_paths 条完整路径，取每个分量
+        #    第一次出现的路径作为多样化证据；未被枚举覆盖的分量（路径组合
+        #    爆炸时必然存在）用 DP 父链直接拼出一条经过它的路径兜底。
+        evidence: dict[int, list[int]] = {}
+        sample_paths: list[list[int]] = []
+        frontier: list[list[int]] = [[s] for s in source_cis]
+        extensions = 0
+        path_truncated = False
+        while frontier:
+            nxt_frontier: list[list[int]] = []
+            stopped = False
+            for p in frontier:
+                for child in sorted(cons[p[-1]]):
+                    if child in p:
+                        continue
+                    extensions += 1
+                    np = p + [child]
+                    if child == target_ci:
+                        if len(sample_paths) < max_paths:
+                            sample_paths.append(np)
+                            for cj in np:
+                                evidence.setdefault(cj, np)
+                        if len(sample_paths) >= max_paths:
+                            stopped = True
+                            break
+                    else:
+                        nxt_frontier.append(np)
+                if stopped:
+                    break
+                if extensions > MAX_KEY_EXTENSIONS:
+                    path_truncated = True
+                    stopped = True
+                    break
+            if stopped or extensions > MAX_KEY_EXTENSIONS:
+                if len(sample_paths) >= max_paths:
+                    path_truncated = True
+                break
+            if len(nxt_frontier) > MAX_KEY_FRONTIER:
+                path_truncated = True
+            frontier = nxt_frontier[:MAX_KEY_FRONTIER]
+        if total_paths > len(sample_paths):
+            path_truncated = True
+
+        # 兜底父链：任取一条通向源（反向）与通向目标（正向）的链
+        chain_to_source: dict[int, int | None] = {}
+        for ci in topo:
+            ps = pred[ci]
+            chain_to_source[ci] = (max(ps, key=lambda p: in_paths[p])
+                                   if ps else None)
+        chain_to_target: dict[int, int | None] = {}
+        for ci in reversed(topo):
+            cs = cons[ci]
+            chain_to_target[ci] = (min(cs, key=lambda c: out_paths[c])
+                                   if cs else None)
+
+        def evidence_for(ci: int) -> list[int]:
+            if ci in evidence:
+                return evidence[ci]
+            prefix: list[int] = []
+            cur: int | None = ci
+            seen_p = set()
+            while cur is not None and cur not in seen_p:
+                seen_p.add(cur)
+                prefix.append(cur)
+                cur = chain_to_source[cur]
+            prefix.reverse()
+            suffix: list[int] = []
+            cur = chain_to_target[ci]
+            seen_s = {ci}
+            while cur is not None and cur not in seen_s:
+                seen_s.add(cur)
+                suffix.append(cur)
+                cur = chain_to_target[cur]
+            return prefix + suffix
+
+        def row_for(ci: int, with_detail: bool) -> dict | None:
+            ms = members[ci]
+            is_scc = cyclic[ci] or len(ms) > 1
+            node_sheet = split_node(ms[0])[0]
+            row: dict = {
+                "cell": None if is_scc else ms[0],
+                "type": "scc" if is_scc else "cell",
+                "node_id": f"scc:{ci}",
+                "sheet": node_sheet if is_scc else split_node(ms[0])[0],
+                "coord": None if is_scc else split_node(ms[0])[1],
+                "display": ("🔁 循环分量（" + "、".join(
+                    display_id(*split_node(m)) for m in ms[:5])
+                    + ("…" if len(ms) > 5 else "") + "）") if is_scc
+                    else display_id(*split_node(ms[0])),
+                "members": ms if is_scc else [ms[0]],
+                "member_displays": [display_id(*split_node(m)) for m in ms],
+                "in_cycle": bool(is_scc),
+                "formula": None if is_scc else self.formulas.get(ms[0]),
+                "value": None if is_scc else self.values.get(ms[0]),
+                "depth": depth_of.get(ci, 0),
+                "covered_paths": coverage[ci],
+                "covered_paths_text": str(coverage[ci]),
+                "coverage_ratio": (coverage[ci] / total_paths)
+                                  if total_paths else 0.0,
+                "cuts_all_paths": bool(total_paths and coverage[ci] == total_paths),
+            }
+            if with_detail:
+                downstream, aff_total = (
+                    downstream_of(ci) if coverage[ci] else ([], 0))
+                ev = evidence_for(ci) if coverage[ci] else None
+                row.update({
+                    "affected_downstream_count": aff_total,
+                    "affected_downstream": downstream[:KEY_NODE_DOWNSTREAM_SAMPLE],
+                    "affected_downstream_display": [
+                        display_id(*split_node(d))
+                        for d in downstream[:KEY_NODE_DOWNSTREAM_SAMPLE]
+                    ],
+                    "affected_downstream_truncated":
+                        aff_total > KEY_NODE_DOWNSTREAM_SAMPLE,
+                    "evidence_path": None if ev is None else [
+                        display_id(*split_node(members[ci2][0])) for ci2 in ev
+                    ],
+                    "evidence_path_raw": None if ev is None else [
+                        members[ci2][0] for ci2 in ev
+                    ],
+                    "evidence_components": None if ev is None else [
+                        {
+                            "node_id": f"scc:{ci2}",
+                            "type": "scc" if (cyclic[ci2] or
+                                              len(members[ci2]) > 1) else "cell",
+                            "displays": [display_id(*split_node(m))
+                                         for m in members[ci2]],
+                        }
+                        for ci2 in ev
+                    ],
+                })
+            return row
+
+        # 候选：目标自身以外、被至少一条路径覆盖的分量
+        candidates = [
+            ci for ci in range(len(members))
+            if ci != target_ci and coverage[ci] >= min_coverage
+        ]
+        if sheet is not None:
+            candidates = [ci for ci in candidates
+                          if any(split_node(m)[0] == sheet for m in members[ci])]
+        if sort == "depth":
+            candidates.sort(key=lambda ci: (-depth_of.get(ci, 0),
+                                            -coverage[ci], members[ci][0]))
+        elif sort == "affected":
+            def aff_count(ci: int) -> int:
+                return sum(member_count[cj] for cj in range(ncomp_t)
+                           if desc_bits[ci] & (1 << cj))
+            candidates.sort(key=lambda ci: (-aff_count(ci),
+                                            -coverage[ci], members[ci][0]))
+        else:
+            candidates.sort(key=lambda ci: (-coverage[ci],
+                                            -depth_of.get(ci, 0), members[ci][0]))
+        total_nodes = len(candidates)
+        sliced = candidates if limit is None else candidates[:limit]
+        rows = [r for ci in sliced if (r := row_for(ci, with_detail=True))]
+
+        return {
+            "root": node,
+            "upstream_node_count": len(reach) - 1,
+            "scc_count": sum(1 for ci in range(len(members))
+                             if cyclic[ci] or len(members[ci]) > 1),
+            "source_count": len(source_cis),
+            "total_paths": total_paths,
+            "total_paths_text": str(total_paths),
+            "sampled_paths": len(sample_paths),
+            "path_truncated": path_truncated,
+            "upstream_truncated": upstream_truncated,
+            "max_paths": max_paths,
+            "total": total_nodes,
+            "returned": len(rows),
+            "filters": {"sheet": sheet, "sort": sort,
+                        "min_coverage": min_coverage},
+            "key_nodes": rows,
+            # 目标若落在循环分量中，给出提示所需信息
+            "root_in_cycle": node in self.cycle_nodes,
+            "root_component_members": members[target_ci]
+                                      if (cyclic[target_ci]
+                                          or len(members[target_ci]) > 1)
+                                      else [node],
         }
 
     # ------------------------------------------------------ 依赖健康审计

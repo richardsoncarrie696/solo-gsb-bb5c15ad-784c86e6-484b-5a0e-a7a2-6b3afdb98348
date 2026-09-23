@@ -14,6 +14,8 @@ from openpyxl import load_workbook
 from .graph import (
     AUDIT_LEVELS,
     DEFAULT_FANOUT_THRESHOLD,
+    DEFAULT_KEY_PATHS,
+    MAX_KEY_PATHS_QUERY,
     WorkbookGraph,
     display_id,
 )
@@ -90,15 +92,8 @@ def workbook_cells(
                            limit=limit, offset=offset)
 
 
-@app.get("/api/workbooks/{wid}/impact")
-def workbook_impact(
-    wid: str,
-    cell: str = Query(..., description="形如 '计算!B1' 的单元格 id"),
-    direction: str = Query(default="downstream", pattern="^(downstream|upstream)$"),
-    max_depth: int = Query(default=50, ge=1, le=200),
-):
-    graph = _get(wid)["graph"]
-    # 兼容带引号的展示形式：'月报 2026'!B1 -> 月报 2026!B1
+def _resolve_cell(graph: WorkbookGraph, cell: str) -> tuple[str, str, str]:
+    """把前端传入的单元格标识（兼容引号 / 绝对引用）解析为内部 node id。"""
     normalized = cell
     if normalized.startswith("'") and "'!" in normalized:
         normalized = normalized[1:].replace("'!", "!", 1)
@@ -108,7 +103,18 @@ def workbook_impact(
     coord = coord.replace("$", "").upper()
     if sheet not in {s.name for s in graph.sheets}:
         raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
-    node = f"{sheet}!{coord}"
+    return f"{sheet}!{coord}", sheet, coord
+
+
+@app.get("/api/workbooks/{wid}/impact")
+def workbook_impact(
+    wid: str,
+    cell: str = Query(..., description="形如 '计算!B1' 的单元格 id"),
+    direction: str = Query(default="downstream", pattern="^(downstream|upstream)$"),
+    max_depth: int = Query(default=50, ge=1, le=200),
+):
+    graph = _get(wid)["graph"]
+    node, sheet, coord = _resolve_cell(graph, cell)
     result = graph.impact(node, direction=direction, max_depth=max_depth)
     result["root_display"] = display_id(sheet, coord)
     result["root_formula"] = graph.formulas.get(node)
@@ -116,6 +122,64 @@ def workbook_impact(
     result["root_in_cycle"] = node in graph.cycle_nodes
     result["root_names"] = graph._names_of(node)
     return result
+
+
+@app.get("/api/workbooks/{wid}/key-nodes")
+def workbook_key_nodes(
+    wid: str,
+    cell: str = Query(..., description="目标单元格，形如 计算!B1"),
+    sheet: str | None = Query(default=None, description="按关键节点所在工作表筛选"),
+    sort: str = Query(default="coverage",
+                      pattern="^(coverage|affected|depth)$"),
+    min_coverage: int = Query(default=1, ge=1, le=10**9),
+    max_paths: int = Query(default=DEFAULT_KEY_PATHS, ge=1,
+                           le=MAX_KEY_PATHS_QUERY),
+):
+    graph = _get(wid)["graph"]
+    node, target_sheet, coord = _resolve_cell(graph, cell)
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    result = graph.key_nodes(node, sheet=sheet, sort=sort,
+                             min_coverage=min_coverage, max_paths=max_paths)
+    result["workbook_id"] = wid
+    result["root_display"] = display_id(target_sheet, coord)
+    return result
+
+
+@app.get("/api/workbooks/{wid}/key-nodes/export")
+def workbook_key_nodes_export(
+    wid: str,
+    cell: str = Query(..., description="目标单元格，形如 计算!B1"),
+    sheet: str | None = Query(default=None, description="按关键节点所在工作表筛选"),
+    sort: str = Query(default="coverage",
+                      pattern="^(coverage|affected|depth)$"),
+    max_paths: int = Query(default=DEFAULT_KEY_PATHS, ge=1,
+                           le=MAX_KEY_PATHS_QUERY),
+):
+    """导出关键节点分析 JSON：不做行数 / 受影响下游截断，证据路径完整。"""
+    entry = _get(wid)
+    graph = entry["graph"]
+    node, target_sheet, coord = _resolve_cell(graph, cell)
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    result = graph.key_nodes(node, sheet=sheet, sort=sort,
+                             min_coverage=1, limit=None, max_paths=max_paths)
+    payload = {
+        "workbook_id": wid,
+        "filename": entry["filename"],
+        "target": node,
+        "target_display": display_id(target_sheet, coord),
+        **result,
+    }
+    return JSONResponse(
+        payload,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=key_nodes_{wid}.json; "
+                f"filename*=UTF-8''key_nodes_{wid}.json"
+            )
+        },
+    )
 
 
 @app.get("/api/workbooks/{wid}/audit")
