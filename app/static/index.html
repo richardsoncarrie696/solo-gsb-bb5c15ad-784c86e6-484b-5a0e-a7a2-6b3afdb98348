@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>电子表格公式影响分析</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #1a2130; --panel2: #222b3d; --border: #2e3a52;
+    --text: #e6ebf5; --muted: #8b98b0; --accent: #4f8cff; --accent2: #34d399;
+    --warn: #f87171; --chip: #2a3550;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  header h1 { font-size: 17px; font-weight: 600; margin-right: auto; }
+  .btn { background: var(--accent); color: #fff; border: none; border-radius: 6px;
+         padding: 7px 14px; cursor: pointer; font-size: 13px; }
+  .btn:hover { opacity: .88; }
+  .btn.ghost { background: var(--chip); color: var(--text); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  #stats { display: none; gap: 16px; padding: 10px 20px; background: var(--panel2);
+           border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }
+  #stats .stat { color: var(--muted); }
+  #stats .stat b { color: var(--text); margin-left: 4px; }
+  #stats .cycles b { color: var(--warn); }
+  #cyclePanel { display: none; padding: 10px 20px; background: #3a1d22; color: #fca5a5;
+                border-bottom: 1px solid var(--border); font-size: 13px; }
+  #cyclePanel .cyc { margin: 4px 0; font-family: ui-monospace, Consolas, monospace; }
+  main { display: flex; height: calc(100vh - 53px); }
+  #sidebar { width: 320px; min-width: 320px; border-right: 1px solid var(--border);
+             background: var(--panel); display: flex; flex-direction: column; }
+  #sidebar .filters { padding: 10px; display: flex; flex-direction: column; gap: 8px;
+                      border-bottom: 1px solid var(--border); }
+  select, input[type=text] { background: var(--panel2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; font-size: 13px; width: 100%; }
+  #cellList { overflow-y: auto; flex: 1; }
+  .cell-item { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #232c40; }
+  .cell-item:hover { background: var(--panel2); }
+  .cell-item.active { background: #263252; border-left: 3px solid var(--accent); }
+  .cell-item .cid { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+  .cell-item .cformula { color: var(--muted); font-size: 12px; margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      font-family: ui-monospace, Consolas, monospace; }
+  .badge { display: inline-block; font-size: 11px; border-radius: 4px; padding: 1px 6px;
+           margin-left: 6px; vertical-align: 1px; }
+  .badge.cycle { background: #7f1d1d; color: #fecaca; }
+  .badge.n { background: var(--chip); color: var(--muted); }
+  .badge.nm { background: #1e3a5f; color: #bfdbfe; font-family: ui-monospace, Consolas, monospace; }
+  .badge.nm.error { background: #7f1d1d; color: #fecaca; }
+  .badge.nm.warning { background: #78350f; color: #fde68a; }
+  .name-line { font-size: 11px; color: var(--muted); margin-top: 3px;
+      font-family: ui-monospace, Consolas, monospace;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .name-line .nm-status { color: #60a5fa; }
+  .name-line .nm-status.error { color: var(--warn); }
+  .name-line .nm-status.warning { color: #fbbf24; }
+  .name-line .nm-status.constant { color: var(--accent2); }
+  #detail { flex: 1; overflow-y: auto; padding: 18px 22px; }
+  #empty { color: var(--muted); text-align: center; margin-top: 120px; line-height: 2; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 16px; }
+  .card h3 { font-size: 13px; color: var(--muted); font-weight: 600; margin-bottom: 10px; }
+  .formula-code { font-family: ui-monospace, Consolas, monospace; background: var(--panel2);
+      border-radius: 6px; padding: 8px 10px; word-break: break-all; font-size: 13px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tab { padding: 6px 14px; border-radius: 6px; background: var(--chip); cursor: pointer;
+         color: var(--muted); border: none; font-size: 13px; }
+  .tab.active { background: var(--accent); color: #fff; }
+  .chip { display: inline-block; background: var(--chip); border-radius: 6px; padding: 4px 9px;
+          margin: 3px 4px 3px 0; cursor: pointer; font-family: ui-monospace, Consolas, monospace;
+          font-size: 12px; }
+  .chip:hover { background: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px;
+       border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); }
+  td { padding: 6px 8px; border-bottom: 1px solid #232c40; vertical-align: top; }
+  td.mono, .mono { font-family: ui-monospace, Consolas, monospace; }
+  .path { color: var(--muted); font-size: 12px; font-family: ui-monospace, Consolas, monospace; }
+  .path a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .path a:hover { text-decoration: underline; }
+  .depth-pill { background: var(--chip); border-radius: 10px; padding: 1px 8px; font-size: 11px; }
+  .link { color: var(--accent); cursor: pointer; }
+  .link:hover { text-decoration: underline; }
+  /* 审计面板 */
+  .badge.sev-error { background: #7f1d1d; color: #fecaca; }
+  .badge.sev-warning { background: #78350f; color: #fde68a; }
+  .badge.sev-info { background: #1e3a5f; color: #bfdbfe; }
+  .badge.code { background: var(--chip); color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  #auditView .filters-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  #auditView select, #auditView input[type=number] { width: auto; min-width: 120px; }
+  #auditView input[type=number] { width: 90px; }
+  .audit-counts { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+  .audit-counts .ac { border-radius: 8px; padding: 6px 12px; background: var(--panel2); font-size: 13px; }
+  .audit-counts .ac b { font-size: 16px; margin-left: 6px; }
+  .audit-counts .ac.error b { color: var(--warn); }
+  .audit-counts .ac.warning b { color: #fbbf24; }
+  .audit-counts .ac.info b { color: #60a5fa; }
+  .ev-list .chip { font-size: 11px; padding: 2px 7px; }
+  .ev-more { color: var(--muted); font-size: 12px; }
+  #auditCountPill { background: var(--warn); color: #fff; border-radius: 10px;
+                    font-size: 11px; padding: 0 7px; margin-left: 4px; display: none; }
+  #auditCountPill.zero { background: var(--accent2); }
+  #dropHint { border: 2px dashed var(--border); border-radius: 10px; padding: 40px;
+              text-align: center; color: var(--muted); margin: 30px; }
+  #dropHint.drag { border-color: var(--accent); color: var(--accent); }
+  .toast { position: fixed; top: 16px; right: 16px; background: #7f1d1d; color: #fecaca;
+           padding: 10px 16px; border-radius: 8px; display: none; z-index: 9; max-width: 420px; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>📊 电子表格公式影响分析</h1>
+  <span id="fname" class="muted"></span>
+  <button class="btn ghost" id="auditBtn" disabled>🩺 依赖健康审计<span id="auditCountPill"></span></button>
+  <button class="btn ghost" id="auditExportBtn" disabled>导出审计 JSON</button>
+  <button class="btn ghost" id="exportBtn" disabled>导出分析 JSON</button>
+  <button class="btn" id="uploadBtn">上传 XLSX</button>
+  <input type="file" id="fileInput" accept=".xlsx,.xlsm" hidden>
+</header>
+
+<div id="stats">
+  <span class="stat">工作表<b id="stSheets"></b></span>
+  <span class="stat">公式单元格<b id="stFormulas"></b></span>
+  <span class="stat">依赖边<b id="stEdges"></b></span>
+  <span class="stat">定义名称<b id="stNames"></b></span>
+  <span class="stat cycles">循环引用<b id="stCycles"></b></span>
+  <span class="stat cycles">审计问题<b id="stAudit">—</b></span>
+</div>
+<div id="cyclePanel"></div>
+
+<div id="dropHint">将 .xlsx 文件拖到此处，或点击右上角「上传 XLSX」<br>
+  <span style="font-size:12px">没有文件？可先下载 <a class="link" href="/samples/sample_impact.xlsx" download>示例文件</a> 体验（含跨表引用、区域引用与循环引用）</span>
+</div>
+
+<main id="main" style="display:none">
+  <div id="sidebar">
+    <div class="filters">
+      <select id="sheetSelect"><option value="">全部工作表</option></select>
+      <input type="text" id="searchBox" placeholder="搜索单元格 / 公式…">
+      <label style="font-size:12px;color:var(--muted)">
+        <input type="checkbox" id="formulaOnly" checked> 仅显示含公式的单元格
+      </label>
+    </div>
+    <div id="cellList"></div>
+  </div>
+  <div id="detail">
+    <div id="empty">← 从左侧选择一个单元格，查看其影响面与依赖链</div>
+    <div id="auditView" style="display:none">
+      <div class="card">
+        <h3>🩺 依赖健康审计</h3>
+        <div class="filters-row">
+          <select id="auditLevel">
+            <option value="">全部级别</option>
+            <option value="error">错误（缺失工作表 / 名称未定义或失效）</option>
+            <option value="warning">警告（空引用 / 越界 / 外部名称 / 高扇出）</option>
+            <option value="info">提示（孤立公式）</option>
+          </select>
+          <select id="auditSheet"><option value="">全部工作表</option></select>
+          <span class="muted" style="font-size:12px">扇出阈值 ≥</span>
+          <input type="number" id="auditFanout" min="1" max="10000" value="20">
+          <button class="btn" id="auditRunBtn" style="padding:6px 14px">重新扫描</button>
+          <span id="auditErr" class="muted" style="font-size:12px;color:var(--warn)"></span>
+        </div>
+        <div class="audit-counts" id="auditCounts"></div>
+      </div>
+      <div class="card">
+        <h3 id="auditTableTitle">问题清单</h3>
+        <table>
+          <thead><tr>
+            <th style="width:70px">级别</th><th style="width:150px">类型</th>
+            <th style="width:190px">单元格位置</th><th>问题与证据边</th>
+          </tr></thead>
+          <tbody id="auditRows"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="detailBody" style="display:none">
+      <div class="card">
+        <h3>当前单元格</h3>
+        <div style="font-size:16px" class="mono" id="dCell"></div>
+        <div style="margin-top:8px" class="formula-code" id="dFormula"></div>
+        <div style="margin-top:8px" class="muted">缓存值：<span id="dValue" class="mono"></span>
+          <span id="dCycleBadge"></span></div>
+        <div id="dNames" style="margin-top:8px"></div>
+      </div>
+      <div class="tabs">
+        <button class="tab active" data-dir="downstream">下游影响（谁受它影响）</button>
+        <button class="tab" data-dir="upstream">上游依赖（它依赖谁）</button>
+      </div>
+      <div class="card">
+        <h3 id="directTitle">直接受影响单元格</h3>
+        <div id="directList"></div>
+      </div>
+      <div class="card">
+        <h3 id="impactTitle">全部受影响单元格（含间接，按层级）</h3>
+        <div id="truncated" class="muted" style="display:none;margin-bottom:8px">⚠ 结果过多，已截断</div>
+        <table>
+          <thead><tr><th style="width:60px">层级</th><th>单元格</th><th>公式</th><th>值</th><th style="width:38%">路径</th></tr></thead>
+          <tbody id="impactRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+let WID = null, CURRENT = null, DIRECTION = 'downstream', AUDIT_SUMMARY = null;
+const LEVEL_LABEL = { error: '错误', warning: '警告', info: '提示' };
+const CODE_LABEL = {
+  missing_sheet: '工作表不存在',
+  undefined_name: '名称未定义',
+  invalid_name: '名称目标失效',
+  external_name: '外部名称',
+  empty_ref: '引用了空单元格',
+  out_of_range: '引用超出已用范围',
+  high_fanout: '扇出过大',
+  orphan_formula: '孤立公式',
+};
+const NAME_STATUS_LABEL = {
+  resolved: '已解析', constant: '常量', formula: '公式',
+  undefined: '未定义', invalid: '目标无效', external: '外部引用',
+};
+const NAME_STATUS_CLASS = {
+  resolved: '', constant: 'constant', formula: '',
+  undefined: 'error', invalid: 'error', external: 'warning',
+};
+const $ = id => document.getElementById(id);
+
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 4000);
+}
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// 名称使用留痕：名称（状态·目标数）+ 定义/作用域提示
+function nameBadge(n) {
+  const cls = NAME_STATUS_CLASS[n.status] || '';
+  const label = NAME_STATUS_LABEL[n.status] || n.status;
+  return `<span class="badge nm ${cls}" title="${esc((n.scope||'') + ' ' + (n.definition||''))}">名·${esc(label)}</span>`;
+}
+function nameLines(names) {
+  if (!names || !names.length) return '';
+  return names.slice(0, 3).map(n => {
+    const cls = NAME_STATUS_CLASS[n.status] || '';
+    const label = NAME_STATUS_LABEL[n.status] || n.status;
+    const scope = n.scope ? `［${esc(n.scope)}］` : '';
+    const tgt = n.target_count > 0 ? ` → ${n.target_count} 个单元格` : '';
+    const def = n.definition ? ` = ${esc(n.definition)}` : '';
+    return `<div class="name-line" title="${esc(n.definition||'')}">🔖 ${esc(n.name_display)} ` +
+      `<span class="nm-status ${cls}">${esc(label)}</span>${esc(scope)}${esc(tgt)}${esc(def)}</div>`;
+  }).join('') + (names.length > 3 ? `<div class="name-line">…另有 ${names.length - 3} 个名称</div>` : '');
+}
+function hasNameError(names) {
+  return (names || []).some(n => ['undefined','invalid'].includes(n.status));
+}
+
+// ---------------- 上传 ----------------
+$('uploadBtn').onclick = () => $('fileInput').click();
+$('fileInput').onchange = e => { if (e.target.files[0]) uploadFile(e.target.files[0]); };
+const hint = $('dropHint');
+['dragover','dragenter'].forEach(ev => document.addEventListener(ev, e => {
+  e.preventDefault(); hint.classList.add('drag');
+}));
+['dragleave','drop'].forEach(ev => document.addEventListener(ev, e => {
+  e.preventDefault(); hint.classList.remove('drag');
+}));
+document.addEventListener('drop', e => {
+  const f = e.dataTransfer.files[0];
+  if (f) uploadFile(f);
+});
+
+async function uploadFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  $('uploadBtn').disabled = true;
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || '上传失败');
+    WID = data.workbook_id;
+    onUploaded(data);
+  } catch (e) { toast(e.message); }
+  finally { $('uploadBtn').disabled = false; }
+}
+
+function onUploaded(d) {
+  $('fname').textContent = d.filename;
+  $('dropHint').style.display = 'none';
+  $('main').style.display = 'flex';
+  $('stats').style.display = 'flex';
+  $('stSheets').textContent = d.sheets.length;
+  $('stFormulas').textContent = d.formula_count;
+  $('stEdges').textContent = d.edge_count;
+  $('stNames').textContent = (d.defined_name_count || 0) +
+    '（工作簿级 ' + (d.workbook_scoped_count || 0) + ' / 工作表级 ' +
+    (d.sheet_scoped_count || 0) + '）';
+  $('stCycles').textContent = d.cycle_count;
+  $('exportBtn').disabled = false;
+  $('auditBtn').disabled = false;
+  $('auditExportBtn').disabled = false;
+  $('stAudit').textContent = '扫描中…';
+  AUDIT_SUMMARY = null;
+  $('auditCountPill').style.display = 'none';
+
+  const sel = $('sheetSelect');
+  sel.innerHTML = '<option value="">全部工作表</option>' +
+    d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}（${s.formula_count} 个公式）</option>`).join('');
+  const asel = $('auditSheet');
+  asel.innerHTML = '<option value="">全部工作表</option>' +
+    d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+
+  const cp = $('cyclePanel');
+  if (d.cycle_count > 0) {
+    cp.style.display = 'block';
+    cp.innerHTML = '⚠ 检测到 ' + d.cycle_count + ' 组循环引用：' +
+      d.cycles.map((c, i) => `<div class="cyc">环 ${i+1}: ` +
+        c.map(n => `<a class="link js-cell" data-cell="${esc(n)}">${esc(n)}</a>`).join(' → ') +
+        ` → ${esc(c[0])}</div>`).join('');
+  } else { cp.style.display = 'none'; cp.innerHTML = ''; }
+  loadCells();
+  loadAuditSummary();
+}
+
+// ---------------- 单元格列表 ----------------
+let searchTimer = null;
+$('sheetSelect').onchange = loadCells;
+$('formulaOnly').onchange = loadCells;
+$('searchBox').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadCells, 250); };
+
+async function loadCells() {
+  if (!WID) return;
+  const p = new URLSearchParams({
+    sheet: $('sheetSelect').value, q: $('searchBox').value,
+    formulas_only: $('formulaOnly').checked, limit: 500,
+  });
+  const r = await fetch(`/api/workbooks/${WID}/cells?` + p);
+  const d = await r.json();
+  $('cellList').innerHTML = d.cells.map(c => `
+    <div class="cell-item" data-cell="${esc(c.cell)}">
+      <div class="cid">${esc(c.display)}
+        ${c.in_cycle ? '<span class="badge cycle">循环</span>' : ''}
+        ${(c.names||[]).length ? nameBadge(c.names.find(n=>hasNameError([n]))||c.names[0]) : ''}
+        <span class="badge n">↓${c.dependent_count} ↑${c.precedent_count}</span></div>
+      ${c.formula ? `<div class="cformula">${esc(c.formula)}</div>` : ''}
+      ${nameLines(c.names)}
+    </div>`).join('') || '<div style="padding:20px;color:var(--muted)">无匹配单元格</div>';
+}
+
+// 事件委托：任何带 data-cell 的元素点击后跳转分析（cell 为内部 id，无引号）
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-cell]');
+  if (el && WID) {
+    // 缺失工作表等没有内部 id 的目标（data-cell 为空）不可跳转
+    if (!el.dataset.cell) return;
+    selectCell(el.dataset.cell);
+  }
+});
+
+// ---------------- 影响面 ----------------
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  DIRECTION = t.dataset.dir;
+  if (CURRENT) loadImpact(CURRENT);
+});
+
+async function selectCell(cell) {
+  // cell 为后端内部 id（工作表名!坐标，无引号）
+  CURRENT = cell;
+  showImpactView();
+  document.querySelectorAll('.cell-item').forEach(el =>
+    el.classList.toggle('active', el.dataset.cell === cell));
+  await loadImpact(cell);
+}
+
+async function loadImpact(cell) {
+  const r = await fetch(`/api/workbooks/${WID}/impact?cell=${encodeURIComponent(cell)}&direction=${DIRECTION}`);
+  const d = await r.json();
+  if (!r.ok) { toast(d.detail || '查询失败'); return; }
+  $('empty').style.display = 'none';
+  $('detailBody').style.display = 'block';
+  $('dCell').textContent = d.root_display;
+  $('dFormula').textContent = d.root_formula || '（非公式单元格）';
+  $('dValue').textContent = d.root_value ?? '—';
+  $('dCycleBadge').innerHTML = d.root_in_cycle ? '<span class="badge cycle">处于循环引用中</span>' : '';
+  $('dNames').innerHTML = (d.root_names && d.root_names.length)
+    ? '<div class="muted" style="font-size:12px;margin-bottom:4px">公式中使用的定义名称：</div>' + nameLines(d.root_names)
+    : '';
+  $('directTitle').textContent = DIRECTION === 'downstream'
+    ? `直接受影响单元格（${d.direct.length}）` : `直接依赖的单元格（${d.direct.length}）`;
+  $('impactTitle').textContent = DIRECTION === 'downstream'
+    ? `全部受影响单元格（含间接，共 ${d.total} 个）` : `全部上游依赖（含间接，共 ${d.total} 个）`;
+  $('directList').innerHTML = d.direct.length
+    ? d.direct.map(c => `<span class="chip js-cell" data-cell="${esc(c.cell)}" title="${esc(c.formula || '')}">${esc(c.display)}${c.in_cycle ? ' 🔁' : ''}</span>`).join('')
+    : '<span class="muted">无</span>';
+  $('truncated').style.display = d.truncated ? 'block' : 'none';
+  $('impactRows').innerHTML = d.impacted.map(it => `
+    <tr>
+      <td><span class="depth-pill">${it.depth}</span></td>
+      <td class="mono"><a class="link js-cell" data-cell="${esc(it.cell)}">${esc(it.display)}</a>
+        ${it.in_cycle ? '<span class="badge cycle">循环</span>' : ''}</td>
+      <td class="mono" style="word-break:break-all">${esc(it.formula || '')}</td>
+      <td class="mono">${esc(it.value ?? '')}</td>
+      <td class="path">${it.path.map((p, idx) => {
+        const node = it.path_raw[idx];
+        return `<a data-cell="${esc(node)}">${esc(p)}</a>`;
+      }).join(' → ')}</td>
+    </tr>`).join('') || '<tr><td colspan="5" class="muted" style="padding:14px">无</td></tr>';
+}
+
+// ---------------- 依赖健康审计 ----------------
+function showImpactView() {
+  $('auditView').style.display = 'none';
+  $('empty').style.display = CURRENT ? 'none' : 'block';
+  $('detailBody').style.display = CURRENT ? 'block' : 'none';
+}
+
+function showAuditView() {
+  $('auditView').style.display = 'block';
+  $('empty').style.display = 'none';
+  $('detailBody').style.display = 'none';
+}
+
+$('auditBtn').onclick = async () => {
+  showAuditView();
+  await loadAudit();
+};
+$('auditRunBtn').onclick = () => loadAudit();
+$('auditLevel').onchange = () => loadAudit();
+$('auditSheet').onchange = () => loadAudit();
+$('auditFanout').onchange = () => loadAudit();
+$('auditExportBtn').onclick = () => {
+  if (WID) window.location = `/api/workbooks/${WID}/audit/export`;
+};
+
+function renderAuditSummary(d) {
+  AUDIT_SUMMARY = d;
+  const c = d.counts_by_level;
+  $('stAudit').textContent = d.total;
+  const pill = $('auditCountPill');
+  pill.textContent = d.total;
+  pill.className = d.total === 0 ? 'zero' : '';
+  pill.style.display = 'inline-block';
+  const codeNames = {
+    missing_sheet: '工作表不存在', undefined_name: '名称未定义',
+    invalid_name: '名称目标失效', external_name: '外部名称',
+    empty_ref: '引用空单元格', out_of_range: '越界引用',
+    high_fanout: '高扇出', orphan_formula: '孤立公式',
+  };
+  $('auditCounts').innerHTML =
+    `<span class="ac error">错误<b>${c.error}</b></span>` +
+    `<span class="ac warning">警告<b>${c.warning}</b></span>` +
+    `<span class="ac info">提示<b>${c.info}</b></span>` +
+    Object.entries(d.counts_by_code).map(([k, v]) =>
+      `<span class="ac">${codeNames[k] || k}<b>${v}</b></span>`).join('') +
+    `<span class="ac">扇出阈值<b>${d.fanout_threshold}</b></span>`;
+}
+
+async function loadAuditSummary() {
+  if (!WID) return;
+  const r = await fetch(`/api/workbooks/${WID}/audit`);
+  if (r.ok) renderAuditSummary(await r.json());
+  else $('stAudit').textContent = '—';
+}
+
+function auditParams() {
+  const p = new URLSearchParams();
+  const lv = $('auditLevel').value;
+  if (lv) p.set('level', lv);
+  const sh = $('auditSheet').value;
+  if (sh) p.set('sheet', sh);
+  const thr = $('auditFanout').value;
+  if (thr !== '') p.set('fanout_threshold', thr);
+  return p;
+}
+
+function renderEvidence(it) {
+  const evs = it.evidence.map(e => {
+    const ref = e.ref ? ` <span class="muted">(${esc(e.ref)})</span>` : '';
+    const target = e.to
+      ? `<a class="link js-cell" data-cell="${esc(e.to)}">${esc(e.to_display)}</a>`
+      : `<span class="muted">${esc(e.to_display || '（无目标）')}</span>`;
+    return `<span class="chip"><a class="link js-cell" data-cell="${esc(e.from)}">${esc(e.from_display)}</a> → ${target}${ref}</span>`;
+  }).join('');
+  const more = it.evidence_truncated
+    ? `<span class="ev-more">…仅展示前 ${it.evidence.length} 条，共 ${it.evidence_total} 条证据边</span>`
+    : '';
+  return `<div class="ev-list">${evs || '<span class="muted">无</span>'} ${more}</div>`;
+}
+
+async function loadAudit() {
+  if (!WID) return;
+  $('auditErr').textContent = '';
+  const p = auditParams();
+  const r = await fetch(`/api/workbooks/${WID}/audit?` + p);
+  const d = await r.json();
+  if (!r.ok) { $('auditErr').textContent = d.detail || '审计失败'; return; }
+  renderAuditSummary(d);
+  $('auditTableTitle').textContent = `问题清单（共 ${d.total} 条）`;
+  $('auditRows').innerHTML = d.issues.map(it => `
+    <tr>
+      <td><span class="badge sev-${it.level}">${LEVEL_LABEL[it.level] || esc(it.level)}</span></td>
+      <td><span class="badge code">${esc(CODE_LABEL[it.code] || it.code)}</span></td>
+      <td class="mono">
+        ${it.cell
+          ? `<a class="link js-cell" data-cell="${esc(it.cell)}">${esc(it.cell_display)}</a>`
+          : '<span class="muted">—</span>'}
+      </td>
+      <td>
+        <div>${esc(it.message)}</div>
+        ${it.target_display ? `<div class="path" style="margin:3px 0">目标：${esc(it.target_display)}</div>` : ''}
+        ${it.name_display ? `<div class="path" style="margin:3px 0">名称：${esc(it.name_display)}` +
+            (it.name_scope ? `（${esc(it.name_scope)}）` : '') +
+            (it.name_chain && it.name_chain.length > 1
+              ? `　解析链：${esc(it.name_chain.join(' -> '))}` : '') + `</div>` : ''}
+        ${it.name_definition ? `<div class="path" style="margin:3px 0">名称定义：${esc(it.name_definition)}</div>` : ''}
+        ${it.formula ? `<div class="formula-code" style="margin:5px 0">${esc(it.formula)}</div>`
+                     : ''}
+        ${it.evidence.length || it.evidence_truncated ? renderEvidence(it) : ''}
+      </td>
+    </tr>`).join('')
+    || '<tr><td colspan="4" class="muted" style="padding:14px">🎉 当前筛选条件下未发现问题</td></tr>';
+}
+
+// ---------------- 导出 ----------------
+$('exportBtn').onclick = () => { if (WID) window.location = `/api/workbooks/${WID}/export`; };
+</script>
+</body>
+</html>
