@@ -39,6 +39,15 @@
     **证据边**，并附带按级别 / 类型的汇总计数；页面提供审计面板与「导出审计 JSON」
 - 💾 一键导出完整分析 JSON（工作表统计、**名称清单与名称使用留痕**、公式清单、
   依赖边、循环环、依赖健康审计）
+- 🔑 **关键节点（上游近似最小割点）**：选定目标单元格后，在其**上游依赖子图**中
+  找出移除后会切断最多「源 → 目标」**独立依赖路径**的单元格
+  - 先沿上游依赖构造子图，再把**循环强连通分量（SCC）压缩为单节点**，在压缩 DAG 上
+    做路径数 DP：覆盖路径数 = 入路径数（各独立输入源到该节点）× 出路径数（该节点到
+    目标）；路径数指数增长超过 `10¹²` 时截断并标记 `saturated`
+  - 每个节点给出覆盖路径数、入 / 出路径数、**受影响下游清单**、一条
+    **源 → 节点 → 目标的证据路径**（可点击跳转），以及压缩分量的全部成员
+  - 支持**按覆盖路径数 / 受影响下游数 / 单元格排序**、**按工作表筛选**、
+    覆盖数下限过滤、分页，并可**导出关键节点 JSON**（受影响下游放宽到 1000 条）
 
 ## 一键启动（Docker Compose）
 
@@ -98,6 +107,8 @@ python -m pytest tests/ -v
 | `GET` | `/api/workbooks/{id}` | 工作簿统计摘要 |
 | `GET` | `/api/workbooks/{id}/cells?sheet=&q=&formulas_only=` | 单元格列表（支持工作表筛选 / 搜索） |
 | `GET` | `/api/workbooks/{id}/impact?cell=参数!B2&direction=downstream` | 影响面分析；`direction` 取 `downstream`（默认，受影响）或 `upstream`（依赖链） |
+| `GET` | `/api/workbooks/{id}/key-nodes?cell=关键节点!B13&sheet=&sort=&min_coverage=` | 上游关键节点（近似最小割点）；支持按工作表筛选、排序（`coverage`/`affected`/`cell`）、覆盖数下限、分页 |
+| `GET` | `/api/workbooks/{id}/key-nodes/export?cell=关键节点!B13` | 导出关键节点分析 JSON（受影响下游上限 1000） |
 | `GET` | `/api/workbooks/{id}/audit?level=&sheet=&fanout_threshold=` | 依赖健康审计；支持按级别（`error`/`warning`/`info`，可重复）、工作表、扇出阈值筛选 |
 | `GET` | `/api/workbooks/{id}/audit/export` | 导出依赖健康审计 JSON（证据边不截断） |
 | `GET` | `/api/workbooks/{id}/export` | 导出完整分析 JSON（含 `audit` 段） |
@@ -118,11 +129,19 @@ curl "http://localhost:8000/api/workbooks/$WID/audit?level=error&level=warning&s
 
 # 下载审计 JSON（证据边完整，不做 100 条截断）
 curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
+
+# 关键节点：目标为「关键节点」表的净利 B13，按覆盖路径数排序
+curl "http://localhost:8000/api/workbooks/$WID/key-nodes?cell=关键节点!B13"
+# 只看「参数」工作表、按受影响下游数排序、覆盖至少 2 条路径
+curl "http://localhost:8000/api/workbooks/$WID/key-nodes?cell=关键节点!B13&sheet=参数&sort=affected&min_coverage=2"
+# 导出关键节点 JSON
+curl -OJ "http://localhost:8000/api/workbooks/$WID/key-nodes/export?cell=关键节点!B13"
 ```
 
 错误响应均为 4xx：工作簿不存在 / 已被淘汰返回 `404`；
 `level` 非法、`fanout_threshold` 不是 1–10000 的整数返回 `400`
-（响应体形如 `{"detail": "fanout_threshold 必须是 1-10000 的整数"}`）。
+（响应体形如 `{"detail": "fanout_threshold 必须是 1-10000 的整数"}`）；
+`cell` 缺少 `工作表!坐标` 形式返回 `400`，引用不存在的工作表返回 `404`。
 
 ### 审计 JSON 结构
 
@@ -261,13 +280,61 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
 审计导出 `/api/workbooks/{id}/audit/export` 在审计结果外另含
 `defined_names`（名称清单）与 `name_usages`（完整名称使用留痕，含解析问题证据）。
 
+### 关键节点 JSON 结构
+
+`/api/workbooks/{id}/key-nodes` 与其导出接口：
+
+```json
+{
+  "workbook_id": "ab12cd34ef56",
+  "root": "关键节点!B13",
+  "root_display": "关键节点!B13",
+  "upstream_total": 10,
+  "component_total": 11,
+  "source_total": 4,
+  "collapsed_scc_count": 0,
+  "path_count_cap": 1000000000000,
+  "truncated": false,
+  "filters": { "sheet": null, "sort": "coverage", "min_coverage": 1 },
+  "total": 10,
+  "key_nodes": [
+    {
+      "rank": 1,
+      "cell": "关键节点!B8",
+      "sheet": "关键节点",
+      "coord": "B8",
+      "display": "关键节点!B8",
+      "formula": "=B6-B7",
+      "is_component": false,
+      "component_members": [ { "cell": "关键节点!B8", "display": "关键节点!B8", "in_cycle": false } ],
+      "coverage": 4,
+      "in_paths": 4,
+      "out_paths": 1,
+      "saturated": false,
+      "affected_downstream_count": 0,
+      "affected_downstream": [],
+      "evidence_path": ["关键节点!B3", "关键节点!B7", "关键节点!B8", "关键节点!B13"],
+      "evidence_path_raw": ["关键节点!B3", "关键节点!B7", "关键节点!B8", "关键节点!B13"]
+    }
+  ]
+}
+```
+
+- `coverage = in_paths × out_paths`：移除该节点后被切断的源→目标路径数（近似割点指标）；
+  `in_paths` / `out_paths` 在压缩 DAG 上按路径计数 DP 得到，`saturated=true` 表示
+  计数超过 `path_count_cap`（10¹²）被截断。
+- `is_component=true` 表示该节点是由循环强连通分量压缩而成，`component_members`
+  列出分量内全部单元格；证据路径会穿过分量的真实成员。
+- 接口内 `affected_downstream` 最多返回 100 条（带 `affected_truncated`），
+  导出接口放宽到 1000 条；`affected_downstream_count` 始终为完整计数。
+
 > 说明：`value` 取自 Excel 保存时的缓存计算结果。openpyxl 不执行公式计算，
 > 由程序新建、从未在 Excel 中打开保存的文件其缓存值为 `null`，属正常现象。
 
 ## 示例文件
 
 `samples/sample_impact.xlsx`（由 `scripts/make_sample.py` 生成，也可在首页直接下载）
-包含 8 个工作表，覆盖所有分析场景：
+包含 9 个工作表，覆盖所有分析场景：
 
 | 工作表 | 内容 |
 |---|---|
@@ -278,6 +345,7 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
 | `循环` | 故意制造的循环引用：`A1↔B1` 互引、`C1=C1*2` 自环、`D1` 为环的下游 |
 | `数据` | 200 行数据表，供审计中的高扇出公式 `SUM(数据!B2:B201)` 引用 |
 | `审计示例` | 覆盖直接引用类审计问题：缺失工作表、越界引用、空单元格引用、高扇出、孤立公式与一条正常公式 |
+| `关键节点` | 独立收入 / 成本渠道汇聚成瓶颈（目标选 `B13` 可看到 `B8` 覆盖最多路径）；`B15↔B16` 循环被压缩为单个关键节点（目标选 `B17`） |
 | `名称` | 覆盖名称管理器：工作簿级 / 工作表级同名遮蔽、跨表限定、区域 / 嵌套 / 公式 / 常量名称，
   以及未定义名称、`#REF!`、指向不存在工作表、外部工作簿、名称循环等审计问题 |
 
@@ -291,7 +359,9 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
    `计算!系数`），以及未定义 / 失效 / 外部名称的状态标记；
 6. 点击右上角「🩺 依赖健康审计」，在审计面板按级别 / 工作表筛选（试试限定到「名称」表），
    或将扇出阈值调小查看高扇出节点，点击证据边中的单元格可跳转到其影响面；
-7. 点击「导出分析 JSON」或「导出审计 JSON」获得机器可读的完整结果（含名称清单与使用留痕）。
+7. 选择 `关键节点!B13`（净利）后切换到「🔑 关键节点」页，`关键节点!B8`（毛利）以
+   覆盖 4 条独立路径居首；再选 `关键节点!B17`，可看到循环 `B15↔B16` 被压缩为一个节点；
+8. 点击「导出分析 JSON」或「导出审计 JSON」获得机器可读的完整结果（含名称清单与使用留痕）。
 
 ## 实现要点
 
@@ -313,6 +383,9 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
   - 名称目标与直接引用走同一套展开 / 越界 / 缺失工作表逻辑，无效目标一律不入图；
   - 迭代版 Tarjan SCC 检测单元格循环引用（经名称建立的边同样参与）；
   - BFS 求影响面，记录最短路径、层级与环标记，默认最大深度 50 / 5000 节点；
+  - `key_nodes()` 在目标的上游子图中复用 Tarjan 结果把循环 SCC 压缩为单节点，
+    在压缩 DAG 上做两遍拓扑 DP 得入 / 出路径数，乘积为覆盖路径数（近似最小割点指标，
+    10¹² 封顶并标记饱和），并以两遍多源 BFS 还原源→节点→目标证据路径；
   - 构图时记录不入图的异常引用与名称使用留痕，`audit()` 汇总八类问题并按级别 /
     工作表筛选，证据边超过 100 条时截断；导出保留名称、解析状态与完整证据。
 - `app/main.py`：FastAPI 路由与内存 LRU 式工作簿缓存（不落盘，重启即清空）。
@@ -325,11 +398,11 @@ curl -OJ "http://localhost:8000/api/workbooks/$WID/audit/export"
 │   ├── main.py              # FastAPI 入口与 API
 │   ├── formula_parser.py    # 公式引用 / 定义名称词法解析
 │   ├── names.py             # 名称管理器：作用域解析、展开、名称环检测
-│   ├── graph.py             # 依赖图 / 环检测 / 影响面 BFS / 审计
+│   ├── graph.py             # 依赖图 / 环检测 / 影响面 BFS / 关键节点 / 审计
 │   └── static/index.html    # 前端单页
 ├── samples/sample_impact.xlsx
 ├── scripts/make_sample.py   # 示例文件生成脚本
-├── tests/                   # pytest 用例（78 个）
+├── tests/                   # pytest 用例（92 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -24,6 +24,13 @@ MAX_IMPACT_NODES = 5000
 DEFAULT_FANOUT_THRESHOLD = 20
 # 单条审计问题附带的证据边上限，防止超大区域把响应撑爆
 MAX_AUDIT_EVIDENCE = 100
+# 关键节点：上游子图节点数上限
+MAX_KEYNODE_NODES = 5000
+# 关键节点：路径数按指数增长，超过该值即截断并标记饱和
+PATH_COUNT_CAP = 10**12
+# 关键节点：每个节点附带的受影响下游单元格上限（接口 / 导出分别取值）
+MAX_KEYNODE_AFFECTED = 100
+MAX_KEYNODE_AFFECTED_EXPORT = 1000
 
 # 审计问题级别 -> 排序权重（越严重越靠前）
 SEVERITY_WEIGHT = {"error": 0, "warning": 1, "info": 2}
@@ -110,6 +117,15 @@ class WorkbookGraph:
     name_usages: dict[str, list[NameUsage]] = field(default_factory=dict)
     name_inventory: list[NameDef] = field(default_factory=list)
     name_resolver: NameResolver | None = field(default=None, repr=False)
+    # node -> 展示 id 的缓存（关键节点 / 审计等大批量展示场景复用）
+    _display_cache: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def display(self, node: str) -> str:
+        cached = self._display_cache.get(node)
+        if cached is None:
+            cached = display_id(*split_node(node))
+            self._display_cache[node] = cached
+        return cached
 
     # ------------------------------------------------------------------ 构图
     @classmethod
@@ -407,6 +423,382 @@ class WorkbookGraph:
             "truncated": truncated,
             "total": len(items),
         }
+
+    # ---------------------------------------------------------- 关键节点
+    def _node_component_of(self, nodes: set[str]) -> dict[str, str]:
+        """把节点映射到分量 id：处于循环 SCC 中的节点映射到同一个分量
+        （即把强连通分量压缩为单节点），其余节点各自独立。"""
+        comp_of: dict[str, str] = {}
+        for cyc in self.cycles:
+            members = [n for n in cyc if n in nodes]
+            if not members:
+                continue
+            # 取排序后的首个成员作为分量代表 / id
+            cid = min(members)
+            for n in members:
+                comp_of[n] = cid
+        for n in nodes:
+            comp_of.setdefault(n, n)
+        return comp_of
+
+    @staticmethod
+    def _dag_walk(
+        nodes: set[str],
+        edges: dict[str, set[str]],
+        sources: set[str],
+    ) -> list[str]:
+        """压缩 DAG 上从 sources 出发的 Kahn 拓扑遍历，返回拓扑序。"""
+        indeg: dict[str, int] = {c: 0 for c in nodes}
+        for c in nodes:
+            for t in edges.get(c, ()):
+                indeg[t] += 1
+        queue = deque(sorted(sources))
+        order: list[str] = []
+        seen: set[str] = set()
+        while queue:
+            c = queue.popleft()
+            if c in seen:
+                continue
+            seen.add(c)
+            order.append(c)
+            for t in sorted(edges.get(c, ())):
+                indeg[t] -= 1
+                if indeg[t] <= 0:
+                    queue.append(t)
+        return order
+
+    @staticmethod
+    def _bfs_parent(
+        starts: set[str],
+        nodes: set[str],
+        neighbors: dict[str, set[str]],
+    ) -> dict[str, str | None]:
+        """子图内多源 BFS，返回每个可达节点到最近起点的父指针（起点为 None）。
+
+        父指针构成 BFS 森林；证据路径在 enrich 阶段沿指针回溯，代价随返回行数
+        增长而不是随子图规模增长。
+        """
+        parent: dict[str, str | None] = {s: None for s in starts if s in nodes}
+        queue = deque(parent)
+        while queue:
+            cur = queue.popleft()
+            for nxt in neighbors.get(cur, ()):
+                if nxt in nodes and nxt not in parent:
+                    parent[nxt] = cur
+                    queue.append(nxt)
+        return parent
+
+    @staticmethod
+    def _reconstruct(
+        member: str,
+        psrc: dict[str, str | None],
+        ptgt: dict[str, str | None],
+        target: str,
+    ) -> list[str]:
+        """沿两遍多源 BFS 的父指针还原一条 源 -> member -> 目标 的最短证据路径。
+
+        父指针构成 BFS 森林，沿指针回溯不会成环；member 须同时可达于源集与目标。
+        """
+        # 前半：member 沿 psrc 退到源点，再反转
+        path: list[str] = [member]
+        cur = psrc[member]
+        while cur is not None:
+            path.append(cur)
+            cur = psrc[cur]
+        path.reverse()
+        # 后半：member 沿 ptgt 走到目标
+        cur = member
+        while cur != target:
+            cur = ptgt[cur]
+            path.append(cur)
+        return path
+
+    def key_nodes(
+        self,
+        target: str,
+        max_nodes: int = MAX_KEYNODE_NODES,
+        sheet: str | None = None,
+        sort: str = "coverage",
+        min_coverage: int = 1,
+        limit: int | None = None,
+        offset: int = 0,
+        evidence_limit: int = MAX_KEYNODE_AFFECTED,
+        enrich: bool = True,
+    ) -> dict:
+        """在目标单元格的上游依赖子图中寻找近似最小割点（关键节点）。
+
+        算法步骤（详见 `_keynode_context`）：上游子图 BFS -> 循环 SCC 压缩为
+        单节点 -> 压缩 DAG 上路径数 DP（coverage = in_paths × out_paths）->
+        位图闭包求受影响下游 -> 为返回页中的行还原证据路径。
+
+        sheet / sort / min_coverage 为服务端筛选排序；limit=None 表示不分页
+        （导出场景，仍对每行的受影响下游清单按 MAX_KEYNODE_AFFECTED_EXPORT
+        上限截断）。enrich=False 时只返回轻量计数字段，不展开下游清单与证据。
+        """
+        ctx = self._keynode_context(target, max_nodes=max_nodes)
+        rows = ctx["rows"]
+        if sheet is not None:
+            rows = [r for r in rows if r["sheet"] == sheet]
+        if min_coverage > 1:
+            rows = [r for r in rows if r["coverage"] >= min_coverage]
+        if sort == "affected":
+            rows.sort(key=lambda r: (-r["affected_downstream_count"], r["cell"]))
+        elif sort == "cell":
+            rows.sort(key=lambda r: r["cell"])
+        # sort == "coverage" 时 rows 已在 context 中按覆盖数降序
+
+        total = len(rows)
+        page = rows if limit is None else rows[offset : offset + limit]
+        if enrich:
+            ev_limit = (MAX_KEYNODE_AFFECTED_EXPORT if limit is None
+                        else evidence_limit)
+            for r in page:
+                self._keynode_enrich(ctx, r, ev_limit)
+        for i, r in enumerate(rows, 1):
+            r["rank"] = i
+        return {
+            "root": target,
+            "root_display": display_id(*split_node(target)),
+            "upstream_total": ctx["upstream_total"],
+            "component_total": ctx["component_total"],
+            "source_total": ctx["source_total"],
+            "collapsed_scc_count": ctx["collapsed_scc_count"],
+            "path_count_cap": PATH_COUNT_CAP,
+            "truncated": ctx["truncated"],
+            "filters": {"sheet": sheet, "sort": sort, "min_coverage": min_coverage},
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "key_nodes": page,
+        }
+
+    def _keynode_context(self, target: str, max_nodes: int) -> dict:
+        """构造关键节点分析的全部共享中间结果与轻量行（仅计数字段）。
+
+        - 沿 precedents 反向 BFS 得到目标的全部上游依赖（含目标自身）；
+        - 将循环强连通分量压缩为单个节点，得到 DAG；
+        - DAG 上两遍拓扑路径数 DP：in_paths（源->分量）、out_paths（分量->目标），
+          coverage = in_paths × out_paths，即移除该分量后被切断的源->目标路径数，
+          路径数超过 PATH_COUNT_CAP 时截断并标记 saturated；
+        - 整数位图闭包求受影响下游（C 层 bit_count 计数，清单延迟到 enrich）；
+        - 两遍多源 BFS 父指针用于在 enrich 阶段按行还原证据路径（计数字段
+          与路径还原解耦，避免对全部节点做昂贵的路径回溯）。
+        """
+        # 1) 上游依赖子图（沿 precedents）
+        sub: set[str] = {target}
+        truncated = False
+        queue = deque([target])
+        while queue:
+            cur = queue.popleft()
+            for nxt in sorted(self.precedents.get(cur, ())):
+                if nxt in sub:
+                    continue
+                if len(sub) >= max_nodes:
+                    truncated = True
+                    break
+                sub.add(nxt)
+                queue.append(nxt)
+            if truncated:
+                break
+
+        # 2) SCC 压缩
+        comp_of = self._node_component_of(sub)
+        sorted_comps = sorted(set(comp_of.values()))
+        comps = set(sorted_comps)
+        comp_index = {c: i for i, c in enumerate(sorted_comps)}
+        # 数据流方向的压缩边：prec -> dep（去重自环/平行边），同时记后继位图
+        cedges: dict[str, set[str]] = {}
+        rev_edges: dict[str, set[str]] = {}
+        succ_mask: dict[str, int] = {c: 0 for c in comps}
+        for dep in sub:
+            cd = comp_of[dep]
+            for prec in self.precedents.get(dep, ()):
+                if prec not in sub:
+                    continue
+                cp = comp_of[prec]
+                if cp == cd:
+                    continue
+                if cd not in cedges.setdefault(cp, set()):
+                    cedges[cp].add(cd)
+                    succ_mask[cp] |= 1 << comp_index[cd]
+                rev_edges.setdefault(cd, set()).add(cp)
+
+        ctarget = comp_of[target]
+        sources = {c for c in comps if not rev_edges.get(c)}
+
+        members_of: dict[str, list[str]] = {}
+        for n in sub:
+            members_of.setdefault(comp_of[n], []).append(n)
+        for ms in members_of.values():
+            ms.sort()
+
+        # 3) DAG 路径数 DP（正向 in_paths / 反向 out_paths）
+        order = self._dag_walk(comps, cedges, sources)
+        in_paths: dict[str, int] = {}
+        saturated: set[str] = set()
+        for c in order:
+            if c in sources:
+                in_paths[c] = 1
+                continue
+            total = 0
+            for p in rev_edges.get(c, ()):
+                total += in_paths.get(p, 0)
+                if total > PATH_COUNT_CAP:
+                    total = PATH_COUNT_CAP
+                    saturated.add(c)
+                    break
+            in_paths[c] = total
+        # 反向：从目标分量出发，沿 rev_edges 做拓扑式传播
+        out_paths: dict[str, int] = {c: 0 for c in comps}
+        out_paths[ctarget] = 1
+        for c in reversed(order):
+            if c == ctarget:
+                continue
+            total = 0
+            for t in cedges.get(c, ()):
+                total += out_paths.get(t, 0)
+                if total > PATH_COUNT_CAP:
+                    total = PATH_COUNT_CAP
+                    saturated.add(c)
+                    break
+            out_paths[c] = total
+
+        # 4) 证据路径：以成员为必经点的最短 源->成员->目标 单元格路径。
+        #    两遍多源 BFS 的父指针构成 BFS 树，沿指针回溯即最短路径。
+        src_members: set[str] = set()
+        for c in sources:
+            if c == ctarget:
+                continue
+            src_members.update(members_of[c])
+        psrc = self._bfs_parent(src_members, sub, self.dependents)
+        ptgt = self._bfs_parent({target}, sub, self.precedents)
+        # 子图内 node -> 展示 id 一次性预算，供全部行 / 路径直接查表
+        sub_display = {n: self.display(n) for n in sub}
+
+        # 5) 受影响下游：移除该分量后，仍在子图内、且不再能到达目标的下游分量
+        #    （在压缩 DAG 上等价于该分量沿数据流的后代集合，目标分量自身除外）。
+        #    整数位图闭包（逆拓扑 DP）：desc[c] = succ(c) ∪ ⋃desc[t]。
+        #    分量计数用 C 层 bit_count（长链 5000 节点也是微秒级）；多成员循环
+        #    分量再按成员数加权修正。清单仅逐位取出至多 limit 个成员，
+        #    避免在极端长链上做 O(V²) 的位图展开。
+        desc_mask: dict[str, int] = {c: 0 for c in comps}
+        for c in reversed(order):
+            mask = succ_mask.get(c, 0)
+            for t in cedges.get(c, ()):
+                mask |= desc_mask[t]
+            desc_mask[c] = mask
+        target_bit = 1 << comp_index[ctarget]
+
+        # 多成员 SCC（真实表格中极少且很小）：按成员数加权的后代单元格计数
+        heavy = {c: len(members_of[c]) for c in comps
+                 if len(members_of[c]) > 1 and c != ctarget}
+
+        def affected_cell_count(c: str) -> int:
+            mask = desc_mask[c] & ~target_bit
+            total = mask.bit_count()
+            for hc, w in heavy.items():
+                if mask & (1 << comp_index[hc]):
+                    total += w - 1
+            return total
+
+        rows: list[dict] = []
+        for c in comps:
+            if c == ctarget:
+                continue  # 目标自身不计入割点
+            coverage = in_paths.get(c, 0) * out_paths.get(c, 0)
+            if coverage <= 0:
+                continue
+            if coverage > PATH_COUNT_CAP:
+                coverage = PATH_COUNT_CAP
+                saturated.add(c)
+            members = members_of[c]
+            rep = members[0]
+            rep_sheet, rep_coord = split_node(rep)
+            rows.append({
+                "_comp": c,
+                "cell": rep,
+                "sheet": rep_sheet,
+                "coord": rep_coord,
+                "display": sub_display[rep],
+                "formula": self.formulas.get(rep),
+                "value": self.values.get(rep),
+                "in_cycle": rep in self.cycle_nodes,
+                "is_component": len(members) > 1,
+                "component_members": [
+                    {"cell": n, "display": sub_display[n],
+                     "in_cycle": n in self.cycle_nodes}
+                    for n in members
+                ],
+                "coverage": coverage,
+                "in_paths": in_paths.get(c, 0),
+                "out_paths": out_paths.get(c, 0),
+                "saturated": c in saturated,
+                "affected_downstream_count": affected_cell_count(c),
+            })
+
+        rows.sort(key=lambda r: (-r["coverage"], r["cell"]))
+        return {
+            "target": target,
+            "sub": sub,
+            "comps": comps,
+            "members_of": members_of,
+            "sorted_comps": sorted_comps,
+            "ctarget": ctarget,
+            "sources": sources,
+            "desc_mask": desc_mask,
+            "target_bit": target_bit,
+            "psrc": psrc,
+            "ptgt": ptgt,
+            "sub_display": sub_display,
+            "rows": rows,
+            "upstream_total": len(sub) - 1,
+            "component_total": len(comps),
+            "source_total": len(sources - {ctarget}),
+            "collapsed_scc_count": sum(
+                1 for ms in members_of.values() if len(ms) > 1),
+            "truncated": truncated,
+        }
+
+    def _keynode_enrich(self, ctx: dict, row: dict, limit: int) -> None:
+        """为一行补上受影响下游清单与一条源->节点->目标的证据路径。
+
+        每行代价与（证据路径长度 + 下游清单条数）成正比，故只在返回页调用，
+        避免在长链 / 大子图上对全部节点做昂贵的路径还原。
+        """
+        c = row.pop("_comp")
+        target = ctx["target"]
+        members_of = ctx["members_of"]
+        sorted_comps = ctx["sorted_comps"]
+        sub_display = ctx["sub_display"]
+        cycle_nodes = self.cycle_nodes
+
+        mask = ctx["desc_mask"][c] & ~ctx["target_bit"]
+        out: list[str] = []
+        truncated = False
+        while mask:
+            lb = mask & -mask
+            ms = members_of[sorted_comps[lb.bit_length() - 1]]
+            if len(out) + len(ms) > limit:
+                out.extend(ms[: max(0, limit - len(out))])
+                truncated = True
+                break
+            out.extend(ms)
+            mask ^= lb
+        row["affected_downstream"] = [
+            {"cell": n, "display": sub_display[n],
+             "in_cycle": n in cycle_nodes}
+            for n in out
+        ]
+        if truncated:
+            row["affected_truncated"] = True
+
+        members = members_of[c]
+        psrc, ptgt = ctx["psrc"], ctx["ptgt"]
+        ev_member = next((n for n in members
+                          if n in psrc and n in ptgt), members[0])
+        raw = self._reconstruct(ev_member, psrc, ptgt, target)
+        row["evidence_path"] = [sub_display[p] for p in raw]
+        row["evidence_path_raw"] = raw
 
     # ------------------------------------------------------ 依赖健康审计
     def _edge(self, src: str, dst: str | None = None,

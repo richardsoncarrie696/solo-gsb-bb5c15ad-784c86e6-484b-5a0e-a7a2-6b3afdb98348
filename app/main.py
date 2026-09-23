@@ -24,7 +24,7 @@ MAX_WORKBOOKS = 5  # 内存中最多保留的工作簿数量，超出后淘汰�
 STATIC_DIR = Path(__file__).parent / "static"
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 
-app = FastAPI(title="电子表格公式影响分析", version="1.1.0")
+app = FastAPI(title="电子表格公式影响分析", version="1.2.0")
 
 # wid -> {"graph": WorkbookGraph, "filename": str, "ts": float}
 _store: OrderedDict[str, dict] = OrderedDict()
@@ -36,6 +36,20 @@ def _get(wid: str) -> dict:
         raise HTTPException(status_code=404, detail="工作簿不存在或已被淘汰，请重新上传")
     _store.move_to_end(wid)
     return entry
+
+
+def _resolve_cell(graph: WorkbookGraph, cell: str) -> tuple[str, str]:
+    """把 '工作表!坐标'（可带引号/$）解析为 (内部 node id, 展示 id)。"""
+    normalized = cell
+    if normalized.startswith("'") and "'!" in normalized:
+        normalized = normalized[1:].replace("'!", "!", 1)
+    if "!" not in normalized:
+        raise HTTPException(status_code=400, detail="cell 参数格式应为 工作表!坐标")
+    sheet, coord = normalized.rsplit("!", 1)
+    coord = coord.replace("$", "").upper()
+    if sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    return f"{sheet}!{coord}", display_id(sheet, coord)
 
 
 @app.get("/")
@@ -98,24 +112,78 @@ def workbook_impact(
     max_depth: int = Query(default=50, ge=1, le=200),
 ):
     graph = _get(wid)["graph"]
-    # 兼容带引号的展示形式：'月报 2026'!B1 -> 月报 2026!B1
-    normalized = cell
-    if normalized.startswith("'") and "'!" in normalized:
-        normalized = normalized[1:].replace("'!", "!", 1)
-    if "!" not in normalized:
-        raise HTTPException(status_code=400, detail="cell 参数格式应为 工作表!坐标")
-    sheet, coord = normalized.rsplit("!", 1)
-    coord = coord.replace("$", "").upper()
-    if sheet not in {s.name for s in graph.sheets}:
-        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
-    node = f"{sheet}!{coord}"
+    node, _ = _resolve_cell(graph, cell)
     result = graph.impact(node, direction=direction, max_depth=max_depth)
+    sheet, coord = node.rsplit("!", 1)
     result["root_display"] = display_id(sheet, coord)
     result["root_formula"] = graph.formulas.get(node)
     result["root_value"] = graph.values.get(node)
     result["root_in_cycle"] = node in graph.cycle_nodes
     result["root_names"] = graph._names_of(node)
     return result
+
+
+@app.get("/api/workbooks/{wid}/key-nodes")
+def workbook_key_nodes(
+    wid: str,
+    cell: str = Query(..., description="目标单元格，形如 '计算!B6'"),
+    sheet: str | None = Query(default=None, description="按节点所在工作表筛选"),
+    sort: str = Query(
+        default="coverage",
+        pattern="^(coverage|affected|cell)$",
+        description="排序：coverage 覆盖路径数（默认）/ affected 受影响下游数 / cell"),
+    min_coverage: int = Query(default=1, ge=1, le=10**12),
+    limit: int = Query(default=500, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+):
+    """目标单元格上游依赖子图中的近似最小割点（关键节点）分析。"""
+    graph = _get(wid)["graph"]
+    node, node_display = _resolve_cell(graph, cell)
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+
+    data = graph.key_nodes(
+        node, sheet=sheet, sort=sort, min_coverage=min_coverage,
+        limit=limit, offset=offset)
+    data.pop("limit", None)
+    data["workbook_id"] = wid
+    data["root_display"] = node_display
+    data["root_formula"] = graph.formulas.get(node)
+    data["root_value"] = graph.values.get(node)
+    data["root_in_cycle"] = node in graph.cycle_nodes
+    data["limit"] = limit
+    return data
+
+
+@app.get("/api/workbooks/{wid}/key-nodes/export")
+def workbook_key_nodes_export(
+    wid: str,
+    cell: str = Query(..., description="目标单元格，形如 '计算!B6'"),
+    sheet: str | None = Query(default=None),
+    sort: str = Query(default="coverage", pattern="^(coverage|affected|cell)$"),
+    min_coverage: int = Query(default=1, ge=1, le=10**12),
+):
+    """导出关键节点分析 JSON（受影响下游清单上限放宽到 1000 条/节点）。"""
+    entry = _get(wid)
+    graph = entry["graph"]
+    node, _ = _resolve_cell(graph, cell)
+    if sheet is not None and sheet not in {s.name for s in graph.sheets}:
+        raise HTTPException(status_code=404, detail=f"工作表不存在: {sheet}")
+    data = graph.key_nodes(
+        node, sheet=sheet, sort=sort, min_coverage=min_coverage,
+        limit=None, enrich=True)
+    data.pop("limit", None)
+    data.pop("offset", None)
+    payload = {"workbook_id": wid, "filename": entry["filename"], **data}
+    return JSONResponse(
+        payload,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=key_nodes_{wid}.json; "
+                f"filename*=UTF-8''key_nodes_{wid}.json"
+            )
+        },
+    )
 
 
 @app.get("/api/workbooks/{wid}/audit")

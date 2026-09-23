@@ -100,6 +100,17 @@
   .audit-counts .ac.info b { color: #60a5fa; }
   .ev-list .chip { font-size: 11px; padding: 2px 7px; }
   .ev-more { color: var(--muted); font-size: 12px; }
+  /* 关键节点面板 */
+  .badge.scc { background: #7f1d1d; color: #fecaca; }
+  #keyView .filters-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  #keyView select, #keyView input[type=number] { width: auto; min-width: 120px; }
+  #keyView input[type=number] { width: 90px; }
+  .key-counts { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+  .key-counts .kc { border-radius: 8px; padding: 6px 12px; background: var(--panel2); font-size: 13px; }
+  .key-counts .kc b { font-size: 16px; margin-left: 6px; }
+  .cov-pill { background: #1e3a5f; color: #bfdbfe; border-radius: 10px; padding: 1px 9px;
+              font-size: 12px; font-family: ui-monospace, Consolas, monospace; }
+  .cov-sat { color: #fbbf24; font-size: 11px; margin-left: 4px; }
   #auditCountPill { background: var(--warn); color: #fff; border-radius: 10px;
                     font-size: 11px; padding: 0 7px; margin-left: 4px; display: none; }
   #auditCountPill.zero { background: var(--accent2); }
@@ -190,6 +201,7 @@
       <div class="tabs">
         <button class="tab active" data-dir="downstream">下游影响（谁受它影响）</button>
         <button class="tab" data-dir="upstream">上游依赖（它依赖谁）</button>
+        <button class="tab" data-dir="keynodes">🔑 关键节点（上游割点）</button>
       </div>
       <div class="card">
         <h3 id="directTitle">直接受影响单元格</h3>
@@ -204,12 +216,49 @@
         </table>
       </div>
     </div>
+    <div id="keyView" style="display:none">
+      <div class="card">
+        <h3>🔑 关键节点（上游近似最小割点）</h3>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">
+          目标 <b class="mono" id="keyRoot"></b>：在其上游依赖子图中，移除后会切断最多
+          「源 → 目标」独立依赖路径的单元格；覆盖路径数 = 入路径数 × 出路径数。
+          循环引用的强连通分量已压缩为单个节点。
+        </div>
+        <div class="filters-row">
+          <select id="keySheet"><option value="">全部工作表</option></select>
+          <select id="keySort">
+            <option value="coverage">按覆盖路径数排序</option>
+            <option value="affected">按受影响下游数排序</option>
+            <option value="cell">按单元格排序</option>
+          </select>
+          <span class="muted" style="font-size:12px">覆盖数 ≥</span>
+          <input type="number" id="keyMinCov" min="1" value="1">
+          <button class="btn" id="keyRunBtn" style="padding:6px 14px">重新分析</button>
+          <button class="btn ghost" id="keyExportBtn" style="padding:6px 14px">导出关键节点 JSON</button>
+          <span id="keyErr" class="muted" style="font-size:12px;color:var(--warn)"></span>
+        </div>
+        <div class="key-counts" id="keyCounts"></div>
+      </div>
+      <div class="card">
+        <h3 id="keyTableTitle">关键节点清单</h3>
+        <div id="keyTruncated" class="muted" style="display:none;margin-bottom:8px">⚠ 上游依赖超过上限，子图已截断，结果为近似值</div>
+        <table>
+          <thead><tr>
+            <th style="width:48px">#</th><th style="width:150px">覆盖路径数</th>
+            <th style="width:200px">节点</th><th style="width:90px">受影响下游</th>
+            <th>证据路径（源 → 节点 → 目标）</th>
+          </tr></thead>
+          <tbody id="keyRows"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </main>
 <div class="toast" id="toast"></div>
 
 <script>
-let WID = null, CURRENT = null, DIRECTION = 'downstream', AUDIT_SUMMARY = null;
+let WID = null, CURRENT = null, DIRECTION = 'downstream', CURRENT_VIEW = 'downstream',
+    KEY_DATA = null, AUDIT_SUMMARY = null;
 const LEVEL_LABEL = { error: '错误', warning: '警告', info: '提示' };
 const CODE_LABEL = {
   missing_sheet: '工作表不存在',
@@ -314,6 +363,9 @@ function onUploaded(d) {
   const asel = $('auditSheet');
   asel.innerHTML = '<option value="">全部工作表</option>' +
     d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+  const ksel = $('keySheet');
+  ksel.innerHTML = '<option value="">全部工作表</option>' +
+    d.sheets.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
 
   const cp = $('cyclePanel');
   if (d.cycle_count > 0) {
@@ -362,12 +414,18 @@ document.addEventListener('click', e => {
   }
 });
 
-// ---------------- 影响面 ----------------
+// ---------------- 影响面 / 关键节点 ----------------
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
   t.classList.add('active');
-  DIRECTION = t.dataset.dir;
-  if (CURRENT) loadImpact(CURRENT);
+  CURRENT_VIEW = t.dataset.dir;
+  if (t.dataset.dir === 'keynodes') {
+    showImpactView();
+    if (CURRENT) loadKeyNodes(CURRENT);
+  } else {
+    DIRECTION = t.dataset.dir;
+    if (CURRENT) loadImpact(CURRENT);
+  }
 });
 
 async function selectCell(cell) {
@@ -376,7 +434,8 @@ async function selectCell(cell) {
   showImpactView();
   document.querySelectorAll('.cell-item').forEach(el =>
     el.classList.toggle('active', el.dataset.cell === cell));
-  await loadImpact(cell);
+  if (CURRENT_VIEW === 'keynodes') await loadKeyNodes(cell);
+  else await loadImpact(cell);
 }
 
 async function loadImpact(cell) {
@@ -417,6 +476,13 @@ async function loadImpact(cell) {
 // ---------------- 依赖健康审计 ----------------
 function showImpactView() {
   $('auditView').style.display = 'none';
+  if (CURRENT_VIEW === 'keynodes') {
+    $('empty').style.display = 'none';
+    $('detailBody').style.display = 'block';
+    $('keyView').style.display = 'block';
+    return;
+  }
+  $('keyView').style.display = 'none';
   $('empty').style.display = CURRENT ? 'none' : 'block';
   $('detailBody').style.display = CURRENT ? 'block' : 'none';
 }
@@ -425,6 +491,7 @@ function showAuditView() {
   $('auditView').style.display = 'block';
   $('empty').style.display = 'none';
   $('detailBody').style.display = 'none';
+  $('keyView').style.display = 'none';
 }
 
 $('auditBtn').onclick = async () => {
@@ -526,6 +593,86 @@ async function loadAudit() {
       </td>
     </tr>`).join('')
     || '<tr><td colspan="4" class="muted" style="padding:14px">🎉 当前筛选条件下未发现问题</td></tr>';
+}
+
+// ---------------- 关键节点（上游近似最小割点）----------------
+$('keyRunBtn').onclick = () => CURRENT && loadKeyNodes(CURRENT);
+$('keySheet').onchange = () => CURRENT && loadKeyNodes(CURRENT);
+$('keySort').onchange = () => CURRENT && loadKeyNodes(CURRENT);
+$('keyMinCov').onchange = () => CURRENT && loadKeyNodes(CURRENT);
+$('keyExportBtn').onclick = () => {
+  if (!WID || !CURRENT) return;
+  const p = keyParams();
+  window.location = `/api/workbooks/${WID}/key-nodes/export?cell=${encodeURIComponent(CURRENT)}&` + p;
+};
+
+function keyParams() {
+  const p = new URLSearchParams();
+  const sh = $('keySheet').value;
+  if (sh) p.set('sheet', sh);
+  p.set('sort', $('keySort').value);
+  const mc = $('keyMinCov').value;
+  if (mc !== '' && Number(mc) > 1) p.set('min_coverage', mc);
+  return p;
+}
+
+function fmtCount(n, cap, sat) {
+  const txt = n >= cap ? cap.toLocaleString() + '+' : n.toLocaleString();
+  return `<span class="cov-pill">${txt}</span>` + (sat ? '<span class="cov-sat" title="路径数过多，已按上限截断">≈饱和</span>' : '');
+}
+
+function renderKeyRows(rows) {
+  $('keyRows').innerHTML = rows.map(r => {
+    const members = r.is_component
+      ? `<div class="path" style="margin-top:3px">压缩分量（${r.component_members.length} 个节点）：` +
+        r.component_members.slice(0, 12).map(m =>
+          `<a class="link js-cell" data-cell="${esc(m.cell)}">${esc(m.display)}</a>`).join('、') +
+        (r.component_members.length > 12 ? ` …另有 ${r.component_members.length - 12} 个` : '') + '</div>'
+      : '';
+    const affected = r.affected_downstream_count
+      ? `<details><summary class="link">${r.affected_downstream_count} 个下游` +
+        (r.affected_truncated ? '（已截断）' : '') + '</summary><div class="ev-list" style="margin-top:4px">' +
+        r.affected_downstream.map(a =>
+          `<span class="chip"><a class="link js-cell" data-cell="${esc(a.cell)}">${esc(a.display)}</a></span>`).join('') +
+        '</div></details>'
+      : '<span class="muted">—</span>';
+    return `<tr>
+      <td><span class="depth-pill">${r.rank}</span></td>
+      <td>${fmtCount(r.coverage, KEY_DATA.path_count_cap, r.saturated)}
+        <div class="path" style="margin-top:3px" title="入路径数 × 出路径数">${r.in_paths.toLocaleString()} × ${r.out_paths.toLocaleString()}</div></td>
+      <td class="mono">
+        <a class="link js-cell" data-cell="${esc(r.cell)}">${esc(r.display)}</a>
+        ${r.is_component ? '<span class="badge scc">循环分量</span>' : (r.in_cycle ? '<span class="badge cycle">循环</span>' : '')}
+        ${r.formula ? `<div class="cformula" style="max-width:260px">${esc(r.formula)}</div>` : ''}
+        ${members}
+      </td>
+      <td>${affected}</td>
+      <td class="path">${(r.evidence_path_raw || []).map((raw, idx) =>
+        `<a class="js-cell" data-cell="${esc(raw)}">${esc(r.evidence_path[idx])}</a>`).join(' → ')}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" class="muted" style="padding:14px">当前筛选条件下没有关键节点（该单元格无上游依赖，或覆盖数阈值过高）</td></tr>';
+}
+
+async function loadKeyNodes(cell) {
+  if (!WID) return;
+  $('keyErr').textContent = '';
+  const p = keyParams();
+  const r = await fetch(`/api/workbooks/${WID}/key-nodes?cell=${encodeURIComponent(cell)}&` + p);
+  const d = await r.json();
+  if (!r.ok) { $('keyErr').textContent = d.detail || '关键节点分析失败'; return; }
+  KEY_DATA = d;
+  $('keyRoot').textContent = d.root_display;
+  $('keyTruncated').style.display = d.truncated ? 'block' : 'none';
+  $('keyCounts').innerHTML =
+    `<span class="kc">上游依赖<b>${d.upstream_total}</b></span>` +
+    `<span class="kc">压缩后节点<b>${d.component_total}</b></span>` +
+    `<span class="kc">独立输入源<b>${d.source_total}</b></span>` +
+    `<span class="kc">压缩循环分量<b>${d.collapsed_scc_count}</b></span>` +
+    `<span class="kc">命中关键节点<b>${d.total}</b></span>`;
+  const sortLabel = {coverage: '覆盖路径数降序', affected: '受影响下游数降序', cell: '单元格升序'};
+  $('keyTableTitle').textContent =
+    `关键节点清单（共 ${d.total} 个，按${sortLabel[d.filters.sort] || '覆盖路径数降序'}）`;
+  renderKeyRows(d.key_nodes);
 }
 
 // ---------------- 导出 ----------------
